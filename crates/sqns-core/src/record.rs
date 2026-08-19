@@ -5,32 +5,37 @@
 //! one — can withhold a record, but it cannot forge one, alter its endpoints,
 //! or replay an older version past its expiry.
 //!
-//! # Identity keys and service keys
+//! # Service keys and identities
 //!
-//! The record's `key` is an **identity key**, and it is meant to live offline.
-//! It signs a [`Delegation`] naming the **service key** that the running node
-//! holds, and clients pin that service key when they dial. The service key
-//! signs the records themselves, which is what lets it refresh them every few
-//! minutes while the identity key stays in a safe.
+//! A record's `key` is a **service key**: the key in `sqc://host:port/<key>`,
+//! the key sQUIC pins, and the key clients look up. The service key signs its
+//! own records, so it can refresh them every few minutes on the host that holds
+//! it.
 //!
-//! Stealing the service key therefore does not let an attacker publish: records
-//! are only accepted under a delegation, and only the identity key can issue
-//! one. Recovery is the operator signing a delegation with a higher serial,
-//! which retires every record made under the old one. A record with no
-//! delegation is signed by its own key and is dialed directly — the original
-//! single-key arrangement, still supported.
+//! A record may also carry a [`Delegation`] binding that service key to an
+//! **identity key**, which is meant to live offline. The identity does one job,
+//! and it is the one job the service key must not be able to do itself: retire
+//! the service key. It can [`RecordBody::Superseded`] it — retiring it and
+//! naming the replacement clients should move to — or [`RecordBody::Revoked`]
+//! it outright.
 //!
-//! If the identity key itself is lost, [`RecordBody::Revoked`] kills it
-//! permanently: the store never accepts another record for that key.
+//! One identity may issue any number of service keys. Each resolves
+//! independently under its own public key, and each is rotated and revoked
+//! without touching the others, so three nodes of the same service are three
+//! service keys with three private keys on three hosts.
+//!
+//! A record with no delegation belongs to no identity and may retire itself,
+//! which keeps standalone single-key deployments able to rotate.
 //!
 //! Canonical encoding (big-endian, no padding):
 //!
 //! ```text
-//! Record     := version:u8 key:[32] serial:u64 issued_at:u64 ttl:u32
-//!               body_kind:u8 body
-//! body       := delegated:u8 [Delegation] n:u8 endpoint*n   when body_kind = 1 (Live)
-//!             | successor:u8 [[32]] reason_len:u16 utf8     when body_kind = 2 (Revoked)
-//! Delegation := service_key:[32] serial:u64 not_after:u64 signature:[64]
+//! Record     := version:u8 key:[32] delegated:u8 [Delegation]
+//!               serial:u64 issued_at:u64 ttl:u32 body_kind:u8 body
+//! body       := n:u8 endpoint*n                  when body_kind = 1 (Live)
+//!             | successor:[32] reason_len:u16 utf8  when body_kind = 2 (Superseded)
+//!             | reason_len:u16 utf8              when body_kind = 3 (Revoked)
+//! Delegation := identity:[32] not_after:u64 signature:[64]
 //! Endpoint   := priority:u16 weight:u16 port:u16 host_type:u8 host
 //! host       := [4]         when host_type = 1 (IPv4)
 //!             | [16]        when host_type = 2 (IPv6)
@@ -39,7 +44,7 @@
 //! ```
 //!
 //! A record signature covers `SIG_CONTEXT || record_bytes`; a delegation
-//! signature covers `DELEGATION_CONTEXT || identity || service_key || serial ||
+//! signature covers `DELEGATION_CONTEXT || identity || service_key ||
 //! not_after`. The two contexts differ so neither signature can be replayed as
 //! the other.
 
@@ -55,13 +60,13 @@ use crate::error::{Error, Result};
 use crate::key::PubKey;
 
 /// Version byte of the record encoding.
-pub const RECORD_VERSION: u8 = 2;
+pub const RECORD_VERSION: u8 = 3;
 
 /// Domain separation prefix for record signatures.
-pub const SIG_CONTEXT: &[u8] = b"sqns-record-v2";
+pub const SIG_CONTEXT: &[u8] = b"sqns-record-v3";
 
 /// Domain separation prefix for delegation signatures.
-pub const DELEGATION_CONTEXT: &[u8] = b"sqns-delegation-v1";
+pub const DELEGATION_CONTEXT: &[u8] = b"sqns-delegation-v2";
 
 /// Longest a delegation may be valid for, in seconds (365 days).
 pub const MAX_DELEGATION_LIFETIME: u64 = 31_536_000;
@@ -86,7 +91,8 @@ pub const MAX_TTL: u32 = 604_800;
 pub const MAX_CLOCK_SKEW: u64 = 300;
 
 const BODY_LIVE: u8 = 1;
-const BODY_REVOKED: u8 = 2;
+const BODY_SUPERSEDED: u8 = 2;
+const BODY_REVOKED: u8 = 3;
 
 const HOST_V4: u8 = 1;
 const HOST_V6: u8 = 2;
@@ -309,19 +315,17 @@ impl FromStr for Endpoint {
     }
 }
 
-/// An identity key's grant of authority to a service key.
+/// An identity key's grant of authority over a service key.
 ///
-/// The identity key signs this offline; the service key named here is what the
-/// node holds, what signs its records, and what clients pin when dialing.
-/// Raising `serial` retires every earlier delegation and every record made
-/// under one, which is how a stolen service key is taken out of service.
+/// Issued offline, wherever the identity key lives, and carried inside every
+/// record the service key publishes. It binds the two keys together so that a
+/// [`RecordBody::Superseded`] or [`RecordBody::Revoked`] record signed by the
+/// identity can retire the service key — the one thing the service key cannot
+/// do for itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Delegation {
-    /// The key clients pin, and the only key whose signature this delegation
-    /// makes valid on the identity's records.
-    pub service_key: PubKey,
-    /// Monotonic counter, starting at 1. Higher retires lower.
-    pub serial: u64,
+    /// The identity that issued this service key and may retire it.
+    pub identity: PubKey,
     /// Absolute expiry, seconds since the Unix epoch.
     pub not_after: u64,
     /// Signature by the identity key.
@@ -330,45 +334,35 @@ pub struct Delegation {
 
 impl Delegation {
     /// The bytes a delegation signature covers.
-    fn signed_message(identity: &PubKey, service_key: &PubKey, serial: u64, not_after: u64) -> Vec<u8> {
-        let mut msg = Vec::with_capacity(DELEGATION_CONTEXT.len() + 80);
+    fn signed_message(identity: &PubKey, service_key: &PubKey, not_after: u64) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(DELEGATION_CONTEXT.len() + 72);
         msg.extend_from_slice(DELEGATION_CONTEXT);
         msg.extend_from_slice(identity.as_bytes());
         msg.extend_from_slice(service_key.as_bytes());
-        msg.extend_from_slice(&serial.to_be_bytes());
         msg.extend_from_slice(&not_after.to_be_bytes());
         msg
     }
 
-    /// Issue a delegation. Run this offline, wherever the identity key lives.
-    pub fn issue(
-        identity: &SigningKey,
-        service_key: PubKey,
-        serial: u64,
-        not_after: u64,
-    ) -> Result<Self> {
-        if serial == 0 {
-            return Err(Error::Delegation("delegation serial must be 1 or more".into()));
-        }
+    /// Issue a delegation over `service_key`. Run this offline.
+    pub fn issue(identity: &SigningKey, service_key: &PubKey, not_after: u64) -> Self {
         let identity_pub = crate::key::public_of(identity);
-        let msg = Self::signed_message(&identity_pub, &service_key, serial, not_after);
-        Ok(Self {
-            service_key,
-            serial,
+        let msg = Self::signed_message(&identity_pub, service_key, not_after);
+        Self {
+            identity: identity_pub,
             not_after,
             signature: identity.sign(&msg).to_bytes(),
-        })
+        }
     }
 
-    /// Check that `identity` really issued this delegation.
-    pub fn verify(&self, identity: &PubKey) -> Result<()> {
-        let vk = identity.verifying_key()?;
+    /// Check that this delegation really covers `service_key`.
+    pub fn verify(&self, service_key: &PubKey) -> Result<()> {
+        let vk = self.identity.verifying_key()?;
         let sig = Signature::from_bytes(&self.signature);
-        let msg = Self::signed_message(identity, &self.service_key, self.serial, self.not_after);
+        let msg = Self::signed_message(&self.identity, service_key, self.not_after);
         vk.verify(&msg, &sig).map_err(|_| {
             Error::Delegation(format!(
-                "delegation to {} is not signed by {identity}",
-                self.service_key
+                "the delegation over {service_key} is not signed by {}",
+                self.identity
             ))
         })
     }
@@ -377,203 +371,180 @@ impl Delegation {
         now >= self.not_after
     }
 
-    fn validate(&self) -> Result<()> {
-        if self.serial == 0 {
-            return Err(Error::Delegation("delegation serial must be 1 or more".into()));
-        }
-        self.service_key.verifying_key()?;
-        Ok(())
-    }
-
     fn encode_into(&self, buf: &mut Vec<u8>) {
-        buf.extend_from_slice(self.service_key.as_bytes());
-        buf.extend_from_slice(&self.serial.to_be_bytes());
+        buf.extend_from_slice(self.identity.as_bytes());
         buf.extend_from_slice(&self.not_after.to_be_bytes());
         buf.extend_from_slice(&self.signature);
     }
 
     fn decode_from(r: &mut Reader<'_>) -> Result<Self> {
         Ok(Self {
-            service_key: PubKey::new(r.array::<32>("delegation service key")?),
-            serial: r.u64("delegation serial")?,
+            identity: PubKey::new(r.array::<32>("delegation identity")?),
             not_after: r.u64("delegation not_after")?,
             signature: r.array::<64>("delegation signature")?,
         })
     }
 }
 
-/// What a record says about its key.
+/// What a record says about its service key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordBody {
-    /// The key is in service at these endpoints.
-    Live {
-        /// Authority under which this record is signed. `None` means the
-        /// identity key signed it itself and is dialed directly.
-        delegation: Option<Delegation>,
-        /// Reachable addresses. Empty withdraws the key.
-        endpoints: Vec<Endpoint>,
-    },
-    /// The key is permanently dead. A store that holds this never accepts
-    /// another record for the key, at any serial.
-    Revoked {
-        /// The operator's new identity, if the revocation named one.
-        ///
-        /// **Untrusted.** Whoever stole the identity key could have written
-        /// this. Surface it to a human; never dial it on the strength of the
-        /// revocation alone.
-        successor: Option<PubKey>,
-        reason: String,
-    },
+    /// The key is in service at these endpoints. Empty withdraws it.
+    Live { endpoints: Vec<Endpoint> },
+    /// The key is retired and its identity issued `successor` in its place.
+    /// Terminal: nothing is accepted for this key again, and lookups forward.
+    Superseded { successor: PubKey, reason: String },
+    /// The key is dead with no replacement. Terminal.
+    Revoked { reason: String },
 }
 
 /// The unsigned body of a record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
-    /// The identity this record speaks for, and the lookup index.
+    /// The service key this record speaks for — the lookup index.
     pub key: PubKey,
-    /// Monotonic version counter; the highest serial wins within a delegation.
+    /// Binding to the identity that issued this key, if it has one.
+    pub delegation: Option<Delegation>,
+    /// Monotonic version counter; the highest serial wins.
     pub serial: u64,
     /// Publication time, seconds since the Unix epoch.
     pub issued_at: u64,
-    /// Lifetime in seconds from `issued_at`. Ignored for revocations, which
-    /// never expire.
+    /// Lifetime in seconds from `issued_at`. Ignored for terminal records,
+    /// which never expire.
     pub ttl: u32,
     pub body: RecordBody,
 }
 
 impl Record {
-    /// A record advertising endpoints, signed directly by its own key.
-    pub fn live(key: PubKey, serial: u64, ttl: u32, endpoints: Vec<Endpoint>) -> Self {
-        Self {
-            key,
-            serial,
-            issued_at: now_unix(),
-            ttl,
-            body: RecordBody::Live {
-                delegation: None,
-                endpoints,
-            },
-        }
-    }
-
-    /// A record advertising endpoints under a delegation, to be signed by the
-    /// delegated service key.
-    pub fn delegated(
+    /// A record advertising endpoints for a service key.
+    pub fn live(
         key: PubKey,
+        delegation: Option<Delegation>,
         serial: u64,
         ttl: u32,
-        delegation: Delegation,
         endpoints: Vec<Endpoint>,
     ) -> Self {
         Self {
             key,
+            delegation,
             serial,
             issued_at: now_unix(),
             ttl,
-            body: RecordBody::Live {
-                delegation: Some(delegation),
-                endpoints,
-            },
+            body: RecordBody::Live { endpoints },
         }
     }
 
-    /// A revocation, which only the identity key can sign.
-    pub fn revoked(
+    /// Retire `key`, forwarding lookups to `successor`.
+    ///
+    /// Signed by the key's identity, or by the key itself when it has none.
+    pub fn superseded(
         key: PubKey,
+        delegation: Option<Delegation>,
         serial: u64,
-        successor: Option<PubKey>,
+        successor: PubKey,
         reason: impl Into<String>,
     ) -> Self {
         Self {
             key,
+            delegation,
             serial,
             issued_at: now_unix(),
             ttl: MAX_TTL,
-            body: RecordBody::Revoked {
+            body: RecordBody::Superseded {
                 successor,
                 reason: reason.into(),
             },
         }
     }
 
-    /// The delegation this record was published under, if any.
-    pub fn delegation(&self) -> Option<&Delegation> {
-        match &self.body {
-            RecordBody::Live { delegation, .. } => delegation.as_ref(),
-            RecordBody::Revoked { .. } => None,
+    /// Retire `key` with no replacement.
+    pub fn revoked(
+        key: PubKey,
+        delegation: Option<Delegation>,
+        serial: u64,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            key,
+            delegation,
+            serial,
+            issued_at: now_unix(),
+            ttl: MAX_TTL,
+            body: RecordBody::Revoked {
+                reason: reason.into(),
+            },
         }
     }
 
-    /// Ordering rank of the record's authority. A record with no delegation
-    /// ranks 0, below every delegation, whose serials start at 1.
-    pub fn delegation_serial(&self) -> u64 {
-        self.delegation().map(|d| d.serial).unwrap_or(0)
-    }
-
-    /// The key a client pins when dialing: the delegated service key, or the
-    /// identity itself when there is no delegation.
-    pub fn service_key(&self) -> PubKey {
-        self.delegation().map(|d| d.service_key).unwrap_or(self.key)
+    /// The identity that issued this service key, if any.
+    pub fn identity(&self) -> Option<PubKey> {
+        self.delegation.as_ref().map(|d| d.identity)
     }
 
     /// The key whose signature this record must carry.
-    fn expected_signer(&self) -> PubKey {
-        self.service_key()
+    ///
+    /// A live record is signed by the service key itself, so publishing stays
+    /// on the host. Retiring it takes the identity — which is exactly what a
+    /// thief who stole the service key does not have.
+    pub fn expected_signer(&self) -> PubKey {
+        match self.body {
+            RecordBody::Live { .. } => self.key,
+            RecordBody::Superseded { .. } | RecordBody::Revoked { .. } => {
+                self.identity().unwrap_or(self.key)
+            }
+        }
     }
 
     pub fn endpoints(&self) -> &[Endpoint] {
         match &self.body {
-            RecordBody::Live { endpoints, .. } => endpoints,
-            RecordBody::Revoked { .. } => &[],
+            RecordBody::Live { endpoints } => endpoints,
+            _ => &[],
         }
+    }
+
+    /// The key this record forwards to, if it was superseded.
+    pub fn successor(&self) -> Option<PubKey> {
+        match &self.body {
+            RecordBody::Superseded { successor, .. } => Some(*successor),
+            _ => None,
+        }
+    }
+
+    pub fn is_superseded(&self) -> bool {
+        matches!(self.body, RecordBody::Superseded { .. })
     }
 
     pub fn is_revoked(&self) -> bool {
         matches!(self.body, RecordBody::Revoked { .. })
     }
 
-    /// A live record with no endpoints is a withdrawal: the key is deliberately
-    /// unreachable, which is different from never having been published, and
-    /// different again from being revoked.
-    pub fn is_withdrawal(&self) -> bool {
-        matches!(&self.body, RecordBody::Live { endpoints, .. } if endpoints.is_empty())
+    /// True for a record that retires its key: nothing is ever accepted for
+    /// that key afterwards, and the record itself never expires.
+    pub fn is_terminal(&self) -> bool {
+        self.is_superseded() || self.is_revoked()
     }
 
-    /// When this record stops being usable. Revocations never do.
+    /// A live record with no endpoints is a withdrawal: deliberately
+    /// unreachable for now, and free to come back.
+    pub fn is_withdrawal(&self) -> bool {
+        matches!(&self.body, RecordBody::Live { endpoints } if endpoints.is_empty())
+    }
+
+    /// When this record stops being usable. Terminal records never do.
     pub fn expires_at(&self) -> u64 {
-        if self.is_revoked() {
+        if self.is_terminal() {
             return u64::MAX;
         }
         self.issued_at.saturating_add(self.ttl as u64)
     }
 
     pub fn is_expired(&self, now: u64) -> bool {
-        !self.is_revoked() && now >= self.expires_at()
+        !self.is_terminal() && now >= self.expires_at()
     }
 
     /// Seconds until expiry, saturating at zero.
     pub fn remaining(&self, now: u64) -> u64 {
         self.expires_at().saturating_sub(now)
-    }
-
-    /// True when `self` should replace `other` in a store.
-    ///
-    /// A newer delegation outranks anything published under an older one, no
-    /// matter how high that record's serial was pushed — which is what takes a
-    /// stolen service key out of service. Below that, the record serial
-    /// decides, and `issued_at` breaks ties so a republish at an unchanged
-    /// serial still refreshes.
-    pub fn supersedes(&self, other: &Record) -> bool {
-        // A revocation is terminal: nothing supersedes it, and it supersedes
-        // everything.
-        if other.is_revoked() {
-            return false;
-        }
-        if self.is_revoked() {
-            return true;
-        }
-        (self.delegation_serial(), self.serial, self.issued_at)
-            > (other.delegation_serial(), other.serial, other.issued_at)
     }
 
     /// Endpoints in preference order: priority ascending, heavier first.
@@ -583,14 +554,29 @@ impl Record {
         out
     }
 
+    /// True when `self` should replace `other` in a store.
+    ///
+    /// Retiring a key is final: a terminal record beats any live one, and
+    /// nothing at all beats a terminal record — which is what stops a thief
+    /// still holding the key from publishing over its own retirement.
+    pub fn supersedes(&self, other: &Record) -> bool {
+        if other.is_terminal() {
+            return false;
+        }
+        if self.is_terminal() {
+            return true;
+        }
+        (self.serial, self.issued_at) > (other.serial, other.issued_at)
+    }
+
     /// Structural checks a server applies before storing.
     pub fn validate(&self) -> Result<()> {
         self.key.verifying_key()?;
+        if let Some(d) = &self.delegation {
+            d.identity.verifying_key()?;
+        }
         match &self.body {
-            RecordBody::Live {
-                delegation,
-                endpoints,
-            } => {
+            RecordBody::Live { endpoints } => {
                 if endpoints.len() > MAX_ENDPOINTS {
                     return Err(Error::Record(format!(
                         "at most {MAX_ENDPOINTS} endpoints, got {}",
@@ -603,60 +589,51 @@ impl Record {
                         self.ttl
                     )));
                 }
-                if let Some(d) = delegation {
-                    d.validate()?;
-                }
             }
-            RecordBody::Revoked { successor, reason } => {
-                if reason.len() > MAX_REASON_LEN {
-                    return Err(Error::Record(format!(
-                        "revocation reason must be at most {MAX_REASON_LEN} bytes, got {}",
-                        reason.len()
-                    )));
+            RecordBody::Superseded { successor, reason } => {
+                successor.verifying_key()?;
+                if *successor == self.key {
+                    return Err(Error::Record(
+                        "a key cannot be superseded by itself".to_string(),
+                    ));
                 }
-                if let Some(s) = successor {
-                    s.verifying_key()?;
-                }
+                check_reason(reason)?;
             }
+            RecordBody::Revoked { reason } => check_reason(reason)?,
         }
         Ok(())
     }
 
     /// Canonical bytes — the signature input, and the on-wire form.
     pub fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(64 + self.endpoints().len() * 12);
+        let mut buf = Vec::with_capacity(80 + self.endpoints().len() * 12);
         buf.push(RECORD_VERSION);
         buf.extend_from_slice(self.key.as_bytes());
+        match &self.delegation {
+            Some(d) => {
+                buf.push(1);
+                d.encode_into(&mut buf);
+            }
+            None => buf.push(0),
+        }
         buf.extend_from_slice(&self.serial.to_be_bytes());
         buf.extend_from_slice(&self.issued_at.to_be_bytes());
         buf.extend_from_slice(&self.ttl.to_be_bytes());
         match &self.body {
-            RecordBody::Live {
-                delegation,
-                endpoints,
-            } => {
+            RecordBody::Live { endpoints } => {
                 buf.push(BODY_LIVE);
-                match delegation {
-                    Some(d) => {
-                        buf.push(1);
-                        d.encode_into(&mut buf);
-                    }
-                    None => buf.push(0),
-                }
                 buf.push(endpoints.len() as u8);
                 for ep in endpoints {
                     ep.encode_into(&mut buf);
                 }
             }
-            RecordBody::Revoked { successor, reason } => {
+            RecordBody::Superseded { successor, reason } => {
+                buf.push(BODY_SUPERSEDED);
+                buf.extend_from_slice(successor.as_bytes());
+                put_string(&mut buf, reason);
+            }
+            RecordBody::Revoked { reason } => {
                 buf.push(BODY_REVOKED);
-                match successor {
-                    Some(s) => {
-                        buf.push(1);
-                        buf.extend_from_slice(s.as_bytes());
-                    }
-                    None => buf.push(0),
-                }
                 put_string(&mut buf, reason);
             }
         }
@@ -678,51 +655,41 @@ impl Record {
             )));
         }
         let key = PubKey::new(r.array::<32>("record key")?);
+        let delegation = match r.u8("delegation presence")? {
+            0 => None,
+            1 => Some(Delegation::decode_from(r)?),
+            other => {
+                return Err(Error::Record(format!(
+                    "invalid delegation presence byte {other:#x}"
+                )));
+            }
+        };
         let serial = r.u64("record serial")?;
         let issued_at = r.u64("record issued_at")?;
         let ttl = r.u32("record ttl")?;
         let body = match r.u8("record body kind")? {
             BODY_LIVE => {
-                let delegation = match r.u8("delegation presence")? {
-                    0 => None,
-                    1 => Some(Delegation::decode_from(r)?),
-                    other => {
-                        return Err(Error::Record(format!(
-                            "invalid delegation presence byte {other:#x}"
-                        )));
-                    }
-                };
                 let count = r.u8("endpoint count")? as usize;
                 let mut endpoints = Vec::with_capacity(count);
                 for _ in 0..count {
                     endpoints.push(Endpoint::decode_from(r)?);
                 }
-                RecordBody::Live {
-                    delegation,
-                    endpoints,
-                }
+                RecordBody::Live { endpoints }
             }
-            BODY_REVOKED => {
-                let successor = match r.u8("successor presence")? {
-                    0 => None,
-                    1 => Some(PubKey::new(r.array::<32>("successor key")?)),
-                    other => {
-                        return Err(Error::Record(format!(
-                            "invalid successor presence byte {other:#x}"
-                        )));
-                    }
-                };
-                RecordBody::Revoked {
-                    successor,
-                    reason: r.string("revocation reason")?,
-                }
-            }
+            BODY_SUPERSEDED => RecordBody::Superseded {
+                successor: PubKey::new(r.array::<32>("successor key")?),
+                reason: r.string("supersede reason")?,
+            },
+            BODY_REVOKED => RecordBody::Revoked {
+                reason: r.string("revocation reason")?,
+            },
             other => {
                 return Err(Error::Record(format!("unknown record body kind {other:#x}")));
             }
         };
         Ok(Self {
             key,
+            delegation,
             serial,
             issued_at,
             ttl,
@@ -730,18 +697,25 @@ impl Record {
         })
     }
 
-    /// Sign with the key this record's authority names: the delegated service
-    /// key, or the identity key when there is no delegation.
+    /// Sign with the key this record's authority calls for: the service key for
+    /// a live record, the issuing identity to retire one.
     pub fn sign(self, sk: &SigningKey) -> Result<SignedRecord> {
         let signer = crate::key::public_of(sk);
         let expected = self.expected_signer();
         if signer != expected {
-            return Err(Error::Signature(match self.delegation() {
-                Some(d) => format!(
-                    "record for {} is delegated to {}, but was signed by {signer}",
-                    self.key, d.service_key
+            return Err(Error::Signature(match (&self.body, self.identity()) {
+                (RecordBody::Live { .. }, _) => format!(
+                    "a live record for {} must be signed by it, not by {signer}",
+                    self.key
                 ),
-                None => format!("record is for {} but was signed by {signer}", self.key),
+                (_, Some(identity)) => format!(
+                    "retiring {} takes its identity {identity}, but it was signed by {signer}",
+                    self.key
+                ),
+                (_, None) => format!(
+                    "retiring {} takes that key itself, but it was signed by {signer}",
+                    self.key
+                ),
             }));
         }
         let body = self.encode();
@@ -751,6 +725,16 @@ impl Record {
             signature: sig.to_bytes(),
         })
     }
+}
+
+fn check_reason(reason: &str) -> Result<()> {
+    if reason.len() > MAX_REASON_LEN {
+        return Err(Error::Record(format!(
+            "reason must be at most {MAX_REASON_LEN} bytes, got {}",
+            reason.len()
+        )));
+    }
+    Ok(())
 }
 
 /// The bytes a record signature actually covers.
@@ -769,23 +753,19 @@ pub struct SignedRecord {
 }
 
 impl SignedRecord {
+    /// The service key this record speaks for — what was looked up, and what a
+    /// client pins when dialing its endpoints.
     pub fn key(&self) -> PubKey {
         self.record.key
     }
 
-    /// The key to pin when dialing this record's endpoints.
-    pub fn service_key(&self) -> PubKey {
-        self.record.service_key()
+    pub fn identity(&self) -> Option<PubKey> {
+        self.record.identity()
     }
 
-    /// Check every signature in the record's chain of authority.
-    ///
-    /// For a delegated record that is two checks: the identity key really
-    /// issued the delegation, and the delegated service key really signed the
-    /// record. A revocation carries no delegation, so it can only ever be
-    /// signed by the identity key itself.
+    /// Check the record's signature, and its delegation if it carries one.
     pub fn verify(&self) -> Result<()> {
-        if let Some(delegation) = self.record.delegation() {
+        if let Some(delegation) = &self.record.delegation {
             delegation.verify(&self.record.key)?;
         }
         let signer = self.record.expected_signer();
@@ -794,18 +774,18 @@ impl SignedRecord {
         vk.verify(&signed_message(&self.record.encode()), &sig)
             .map_err(|_| {
                 Error::Signature(format!(
-                    "record for {} is not signed by {signer}",
+                    "the record for {} is not signed by {signer}",
                     self.record.key
                 ))
             })
     }
 
-    /// Verify the signature chain, that the record answers the key that was
-    /// asked for, that it is structurally sound, and that neither it nor its
+    /// Verify the signature, that the record answers the key that was asked
+    /// for, that it is structurally sound, and that neither it nor its
     /// delegation has expired.
     ///
-    /// This is what a client runs on every answer; it is the reason a hostile
-    /// server cannot lie about where a key lives.
+    /// This is what a client runs on every answer, and on every hop of a
+    /// supersede chain.
     pub fn verify_answer(&self, asked: &PubKey, now: u64) -> Result<()> {
         if self.record.key != *asked {
             return Err(Error::KeyMismatch {
@@ -815,12 +795,14 @@ impl SignedRecord {
         }
         self.verify()?;
         self.record.validate()?;
-        if let Some(d) = self.record.delegation()
+        if let Some(d) = &self.record.delegation
             && d.is_expired(now)
+            && !self.record.is_terminal()
         {
             return Err(Error::Delegation(format!(
-                "delegation to {} expired {}s ago",
-                d.service_key,
+                "the delegation over {} from {} expired {}s ago",
+                self.record.key,
+                d.identity,
                 now - d.not_after
             )));
         }
@@ -830,19 +812,22 @@ impl SignedRecord {
         Ok(())
     }
 
-    /// The error a revoked record should be reported as, if it is one.
+    /// The error a retired key should be reported as, if it is one.
+    ///
+    /// A supersede is not an error to a caller that follows it, so this returns
+    /// `None` for that case; see [`Record::successor`].
     pub fn revocation_error(&self) -> Option<Error> {
         match &self.record.body {
-            RecordBody::Revoked { successor, reason } => Some(Error::Revoked {
+            RecordBody::Revoked { reason } => Some(Error::Revoked {
                 key: self.record.key.to_string(),
-                successor: successor.map(|s| s.to_string()),
+                successor: None,
                 reason: if reason.is_empty() {
                     "no reason given".to_string()
                 } else {
                     reason.clone()
                 },
             }),
-            RecordBody::Live { .. } => None,
+            _ => None,
         }
     }
 
@@ -878,37 +863,40 @@ impl SignedRecord {
 /// A delegation as it is carried on disk, between the offline identity key that
 /// issues it and the node that publishes under it.
 ///
-/// A record embeds the delegation alone, because the identity is already the
-/// record's key. A standalone file has no such context, so it names the
-/// identity too.
+/// A record embeds the delegation next to the service key it covers. A
+/// standalone file has no such context, so it names that service key too.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DelegationFile {
-    pub identity: PubKey,
+    pub service_key: PubKey,
     pub delegation: Delegation,
 }
 
 const DELEGATION_FILE_MAGIC: &[u8; 7] = b"SQNSDEL";
-const DELEGATION_FILE_VERSION: u8 = 1;
+const DELEGATION_FILE_VERSION: u8 = 2;
 
 impl DelegationFile {
-    pub fn new(identity: PubKey, delegation: Delegation) -> Self {
+    pub fn new(service_key: PubKey, delegation: Delegation) -> Self {
         Self {
-            identity,
+            service_key,
             delegation,
         }
+    }
+
+    pub fn identity(&self) -> PubKey {
+        self.delegation.identity
     }
 
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(128);
         buf.extend_from_slice(DELEGATION_FILE_MAGIC);
         buf.push(DELEGATION_FILE_VERSION);
-        buf.extend_from_slice(self.identity.as_bytes());
+        buf.extend_from_slice(self.service_key.as_bytes());
         self.delegation.encode_into(&mut buf);
         buf
     }
 
-    /// Decode and check that the identity named really issued the delegation,
-    /// so a tampered file fails here rather than at publish time.
+    /// Decode and check the signature, so a tampered file fails here rather
+    /// than at publish time.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut r = Reader::new(bytes);
         let magic = r.bytes(DELEGATION_FILE_MAGIC.len(), "delegation magic")?;
@@ -921,12 +909,12 @@ impl DelegationFile {
                 "unsupported delegation file version {version}"
             )));
         }
-        let identity = PubKey::new(r.array::<32>("delegation identity")?);
+        let service_key = PubKey::new(r.array::<32>("delegation service key")?);
         let delegation = Delegation::decode_from(&mut r)?;
         r.finish("delegation file")?;
-        delegation.verify(&identity)?;
+        delegation.verify(&service_key)?;
         Ok(Self {
-            identity,
+            service_key,
             delegation,
         })
     }

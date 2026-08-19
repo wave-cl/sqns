@@ -1,13 +1,14 @@
 //! Self-registration: sign your own endpoint set and keep it refreshed.
 //!
-//! A node publishes under its own authority — either its identity key directly,
-//! or, better, a service key that the identity key delegated to it. Records
-//! expire, so a node that goes away stops being advertised without anyone
-//! having to retract it: the publisher re-signs on a timer well inside the TTL.
+//! A node holds a service key and publishes records under it — the key clients
+//! look up and pin. Records expire, so a node that goes away stops being
+//! advertised without anyone having to retract it: the publisher re-signs on a
+//! timer well inside the TTL.
 //!
-//! Under a delegation the identity key is never in this process. That is the
-//! point: a host compromise yields the service key, which is useless for
-//! publishing once the operator issues a delegation with a higher serial.
+//! When the service key carries a delegation, the identity key that issued it
+//! is never in this process. That is the point: a host compromise yields a key
+//! that can publish endpoints but can never retire itself or forward anyone
+//! elsewhere, and the identity can retire it from somewhere safe.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,13 +25,10 @@ use crate::resolver::Resolver;
 /// Default record lifetime, in seconds.
 pub const DEFAULT_TTL: u32 = 300;
 
-/// Publishes and refreshes the record for one identity.
+/// Publishes and refreshes the record for one service key.
 pub struct Publisher {
-    /// The key that signs records: the delegated service key, or the identity
-    /// key itself when publishing without a delegation.
+    /// The service key: it signs the records and is what clients look up.
     signing_key: SigningKey,
-    /// The identity the records speak for — the key clients look up.
-    identity: PubKey,
     delegation: Option<Delegation>,
     endpoints: Vec<Endpoint>,
     ttl: u32,
@@ -40,9 +38,9 @@ pub struct Publisher {
 impl Publisher {
     /// The serial starts at the current wall-clock second, so a record signed
     /// after a restart still supersedes whatever the network already holds.
+    /// Publish under a standalone service key, belonging to no identity.
     pub fn new(signing_key: SigningKey, endpoints: Vec<Endpoint>, ttl: u32) -> Self {
         Self {
-            identity: public_of(&signing_key),
             signing_key,
             delegation: None,
             endpoints,
@@ -51,29 +49,19 @@ impl Publisher {
         }
     }
 
-    /// Publish for `identity` using a service key it delegated to.
+    /// Publish under a service key an identity issued.
     ///
-    /// Fails unless the delegation was really issued by `identity` and names
-    /// exactly this service key — catching a mismatched pair here rather than
-    /// on the server.
+    /// Fails unless the delegation really covers this key — catching a
+    /// mismatched pair here rather than on the server.
     pub fn delegated(
-        identity: PubKey,
         service_key: SigningKey,
         delegation: Delegation,
         endpoints: Vec<Endpoint>,
         ttl: u32,
     ) -> Result<Self> {
-        delegation.verify(&identity)?;
-        let service_pub = public_of(&service_key);
-        if delegation.service_key != service_pub {
-            return Err(Error::Delegation(format!(
-                "delegation names service key {} but this node holds {service_pub}",
-                delegation.service_key
-            )));
-        }
+        delegation.verify(&public_of(&service_key))?;
         Ok(Self {
             signing_key: service_key,
-            identity,
             delegation: Some(delegation),
             endpoints,
             ttl,
@@ -81,14 +69,14 @@ impl Publisher {
         })
     }
 
-    /// The identity these records speak for.
+    /// The service key these records speak for — what clients look up.
     pub fn key(&self) -> PubKey {
-        self.identity
+        public_of(&self.signing_key)
     }
 
-    /// The key clients pin when dialing.
-    pub fn service_key(&self) -> PubKey {
-        public_of(&self.signing_key)
+    /// The identity that issued this service key, if any.
+    pub fn identity(&self) -> Option<PubKey> {
+        self.delegation.as_ref().map(|d| d.identity)
     }
 
     pub fn delegation(&self) -> Option<&Delegation> {
@@ -112,10 +100,13 @@ impl Publisher {
 
     fn sign(&self, endpoints: Vec<Endpoint>) -> Result<SignedRecord> {
         let serial = self.serial.fetch_add(1, Ordering::SeqCst);
-        let record = match &self.delegation {
-            Some(d) => Record::delegated(self.identity, serial, self.ttl, d.clone(), endpoints),
-            None => Record::live(self.identity, serial, self.ttl, endpoints),
-        };
+        let record = Record::live(
+            self.key(),
+            self.delegation.clone(),
+            serial,
+            self.ttl,
+            endpoints,
+        );
         record.validate()?;
         record.sign(&self.signing_key)
     }
@@ -127,7 +118,8 @@ impl Publisher {
     }
 
     /// Withdraw the key: publish a record with no endpoints, so lookups get a
-    /// definite "deliberately unreachable" rather than a stale address.
+    /// definite "deliberately unreachable" rather than a stale address. The key
+    /// stays alive and can be published again later.
     pub async fn withdraw(&self, resolver: &Resolver) -> Result<u64> {
         self.publish_endpoints(resolver, Vec::new()).await
     }

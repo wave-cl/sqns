@@ -1,6 +1,6 @@
 //! The resolver: look up keys, publish records, talk to several servers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -53,44 +53,48 @@ pub fn hex_seed(sk: &SigningKey) -> String {
     sk.to_bytes().iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Where an identity currently lives, and which key to pin when dialing it.
+/// Most supersede hops a lookup will follow before giving up.
+pub const MAX_SUPERSEDE_HOPS: usize = 8;
+
+/// Where a service key currently lives, after following any rotations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceLocation {
-    /// The key that was looked up. This never changes across a rotation.
-    pub identity: PubKey,
-    /// The key to pin for the sQUIC handshake — the delegated service key, or
-    /// the identity itself when the record carries no delegation.
-    pub service_key: PubKey,
+    /// The key the caller asked for.
+    pub requested: PubKey,
+    /// The key actually reached, and the one to pin for the sQUIC handshake.
+    /// It differs from `requested` when the key has been rotated.
+    pub key: PubKey,
+    /// The identity that issued `key`, if it carries a delegation.
+    pub identity: Option<PubKey>,
     /// Endpoints in the order they should be tried.
     pub endpoints: Vec<Endpoint>,
-    /// Authority version. A higher value means the identity has rotated its
-    /// service key since; callers that pin a key should update on a change.
-    pub delegation_serial: u64,
+    /// Keys walked through to get here, oldest first. Empty when the requested
+    /// key answered directly.
+    pub superseded_from: Vec<PubKey>,
 }
 
 impl ServiceLocation {
-    /// True when the key to dial differs from the key that was looked up.
-    pub fn is_delegated(&self) -> bool {
-        self.service_key != self.identity
+    /// True when the caller's key has been rotated and its pinned copy is out
+    /// of date.
+    pub fn is_stale(&self) -> bool {
+        self.key != self.requested
     }
 }
 
 /// How authoritative a record is, for spotting a server walking one backwards.
 ///
-/// Ordered revocation-first, so a revocation outranks every live record and a
+/// Ordered terminal-first, so a retirement outranks every live record and a
 /// server can never follow one with anything else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct Rank {
-    revoked: bool,
-    delegation_serial: u64,
+    terminal: bool,
     serial: u64,
 }
 
 impl Rank {
     fn of(record: &Record) -> Self {
         Self {
-            revoked: record.is_revoked(),
-            delegation_serial: record.delegation_serial(),
+            terminal: record.is_terminal(),
             serial: record.serial,
         }
     }
@@ -145,27 +149,39 @@ impl Resolver {
     /// Every answer is signature-checked against `key` before it is returned or
     /// cached, so a server can withhold an answer but never fabricate one.
     pub async fn lookup(&self, key: &PubKey) -> Result<Option<SignedRecord>> {
+        Ok(self.fetch(key).await?.0)
+    }
+
+    /// The record for `key`, plus the successor's record when the answer
+    /// forwards — the server sends both, which spares a round trip per hop.
+    ///
+    /// The successor is returned unverified; it is checked against the key the
+    /// tombstone actually names before it is used.
+    async fn fetch(&self, key: &PubKey) -> Result<(Option<SignedRecord>, Option<SignedRecord>)> {
         if self.config.cache && let Some(hit) = self.cache.get(key) {
-            return Ok(hit);
+            return Ok((hit, None));
         }
         let response = self
             .try_servers(Request::Lookup { key: *key }, "lookup")
             .await?;
         match response {
-            Response::Answer { record: Some(rec) } => {
+            Response::Answer {
+                record: Some(rec),
+                successor,
+            } => {
                 let rec = *rec;
                 rec.verify_answer(key, now_unix())?;
                 self.note_rank(&rec)?;
                 if self.config.cache {
                     self.cache.put(rec.clone());
                 }
-                Ok(Some(rec))
+                Ok((Some(rec), successor.map(|s| *s)))
             }
-            Response::Answer { record: None } => {
+            Response::Answer { record: None, .. } => {
                 if self.config.cache {
                     self.cache.put_missing(*key);
                 }
-                Ok(None)
+                Ok((None, None))
             }
             other => Err(unexpected(other)),
         }
@@ -185,45 +201,132 @@ impl Resolver {
         }
     }
 
-    /// Like [`lookup`], but refuses a revoked key.
+    /// Like [`lookup`], but refuses a key that has been retired.
     ///
     /// [`lookup`] hands back the tombstone so a caller can show it; anything
-    /// that intends to *connect* should come through here, so a dead identity
-    /// is an error rather than an empty endpoint list.
+    /// that intends to *connect* should come through here or
+    /// [`resolve_service`], so a dead key is an error rather than an empty
+    /// endpoint list.
     ///
     /// [`lookup`]: Resolver::lookup
+    /// [`resolve_service`]: Resolver::resolve_service
     pub async fn lookup_live(&self, key: &PubKey) -> Result<Option<SignedRecord>> {
         let record = self.lookup(key).await?;
-        if let Some(rec) = &record
-            && let Some(revoked) = rec.revocation_error()
-        {
-            return Err(revoked);
+        if let Some(rec) = &record {
+            retirement_error(rec).map_or(Ok(()), Err)?;
         }
         Ok(record)
     }
 
-    /// Where `key` lives and which key to pin when dialing it.
+    /// Where `key` lives, following any rotations along the way.
     ///
-    /// Rotating the service key is invisible here beyond the returned
-    /// `service_key` changing: the identity that was looked up stays the same,
-    /// so callers keep resolving the key they already had.
+    /// A key that has been superseded forwards to its replacement, and the
+    /// returned location names the key actually reached — pin that one. Every
+    /// hop is verified against the key the previous record named, the walk is
+    /// capped at [`MAX_SUPERSEDE_HOPS`], and a cycle is an error rather than a
+    /// spin.
     pub async fn resolve_service(&self, key: &PubKey) -> Result<ServiceLocation> {
-        match self.lookup_live(key).await? {
-            Some(rec) => Ok(ServiceLocation {
-                identity: rec.key(),
-                service_key: rec.service_key(),
-                endpoints: order_endpoints(&rec.record),
-                delegation_serial: rec.record.delegation_serial(),
-            }),
-            None => Err(Error::Unpublished(key.to_string())),
+        let mut current = *key;
+        let mut visited = HashSet::from([current]);
+        let mut chain = Vec::new();
+        // A successor record the server already handed us, saving a round trip.
+        let mut prefetched: Option<SignedRecord> = None;
+
+        for _ in 0..MAX_SUPERSEDE_HOPS {
+            let (record, successor) = match prefetched.take() {
+                Some(rec) => (Some(rec), None),
+                None => self.fetch(&current).await?,
+            };
+            let Some(record) = record else {
+                return Err(Error::Unpublished(current.to_string()));
+            };
+            if let Some(revoked) = record.revocation_error() {
+                return Err(revoked);
+            }
+
+            let Some(next) = record.record.successor() else {
+                return Ok(ServiceLocation {
+                    requested: *key,
+                    key: record.key(),
+                    identity: record.identity(),
+                    endpoints: order_endpoints(&record.record),
+                    superseded_from: chain,
+                });
+            };
+
+            if !visited.insert(next) {
+                return Err(Error::SupersedeChain(format!(
+                    "{key} forwards in a cycle, back to {next}"
+                )));
+            }
+            chain.push(current);
+
+            // Use the inline successor only if it is really the record for the
+            // key this tombstone named.
+            if let Some(candidate) = successor
+                && candidate.key() == next
+                && candidate.verify_answer(&next, now_unix()).is_ok()
+                && self.note_rank(&candidate).is_ok()
+            {
+                if self.config.cache {
+                    self.cache.put(candidate.clone());
+                }
+                prefetched = Some(candidate);
+            }
+            current = next;
+        }
+
+        Err(Error::SupersedeChain(format!(
+            "{key} forwards through more than {MAX_SUPERSEDE_HOPS} keys"
+        )))
+    }
+
+    /// Every record this server holds for keys `identity` has issued.
+    ///
+    /// A server can leave a key out, so this is for tooling and auditing, not
+    /// for resolution — which never depends on it.
+    pub async fn lookup_identity(&self, identity: &PubKey) -> Result<Vec<SignedRecord>> {
+        let response = self
+            .try_servers(
+                Request::LookupIdentity {
+                    identity: *identity,
+                },
+                "identity lookup",
+            )
+            .await?;
+        match response {
+            Response::Records { records, .. } => {
+                let now = now_unix();
+                let mut out = Vec::with_capacity(records.len());
+                for rec in records {
+                    // Each record still has to stand on its own signature, and
+                    // really be issued by the identity we asked about.
+                    let key = rec.key();
+                    rec.verify_answer(&key, now)?;
+                    if rec.identity() != Some(*identity) {
+                        return Err(Error::Delegation(format!(
+                            "{key} was listed under {identity} but is not issued by it"
+                        )));
+                    }
+                    out.push(rec);
+                }
+                Ok(out)
+            }
+            other => Err(unexpected(other)),
         }
     }
 
     /// Endpoints for `key`, in the order they should be tried.
     ///
+    /// Follows rotations, so this returns the endpoints of whatever key the
+    /// requested one now points at. Use [`resolve_service`] when the caller
+    /// needs to know that the key changed.
+    ///
     /// Returns [`Error::Unpublished`] when no server holds a record, and
     /// [`Error::Revoked`] when the key is dead. A record that exists but lists
     /// no endpoints is a deliberate withdrawal and yields an empty vector.
+    ///
+    /// [`resolve_service`]: Resolver::resolve_service
     pub async fn resolve(&self, key: &PubKey) -> Result<Vec<Endpoint>> {
         Ok(self.resolve_service(key).await?.endpoints)
     }
@@ -340,6 +443,17 @@ fn describe(resp: Response) -> String {
     }
 }
 
+/// The error a retired key should be reported as, if it is one.
+pub fn retirement_error(record: &SignedRecord) -> Option<Error> {
+    if let Some(successor) = record.record.successor() {
+        return Some(Error::Superseded {
+            key: record.key().to_string(),
+            successor: successor.to_string(),
+        });
+    }
+    record.revocation_error()
+}
+
 fn unexpected(resp: Response) -> Error {
     match resp {
         Response::Error { .. } => resp.into_server_error(),
@@ -351,7 +465,7 @@ fn unexpected(resp: Response) -> Error {
 mod tests {
     use super::*;
     use sqns_core::key::{generate, public_of};
-    use sqns_core::record::{Delegation, Host, Record};
+    use sqns_core::record::{Host, Record};
     use std::net::Ipv4Addr;
 
     /// A resolver pointed at an address it never dials — enough to exercise the
@@ -366,50 +480,40 @@ mod tests {
     }
 
     #[test]
-    fn a_server_cannot_walk_a_delegation_backwards() {
-        let resolver = offline_resolver();
-        let identity = generate();
-        let old_service = generate();
-        let new_service = generate();
-        let id_pub = public_of(&identity);
-        let now = now_unix();
+    fn a_server_cannot_follow_a_retirement_with_a_live_record() {
+        let node = generate();
+        let key = public_of(&node);
+        let successor = public_of(&generate());
 
-        let d1 = Delegation::issue(&identity, public_of(&old_service), 1, now + 86_400).unwrap();
-        let d2 = Delegation::issue(&identity, public_of(&new_service), 2, now + 86_400).unwrap();
-        let under_d1 = Record::delegated(id_pub, 5, 300, d1, endpoints())
-            .sign(&old_service)
-            .unwrap();
-        let under_d2 = Record::delegated(id_pub, 1, 300, d2, endpoints())
-            .sign(&new_service)
-            .unwrap();
+        for retired in [
+            Record::superseded(key, None, 1, successor, "rotated"),
+            Record::revoked(key, None, 1, "stolen"),
+        ] {
+            let resolver = offline_resolver();
+            let tombstone = retired.sign(&node).unwrap();
+            let live = Record::live(key, None, u64::MAX, 300, endpoints())
+                .sign(&node)
+                .unwrap();
 
-        resolver.note_rank(&under_d2).expect("first answer is accepted");
-
-        // Both records are properly signed; the older authority is still a
-        // downgrade, even though its record serial is higher.
-        let err = resolver.note_rank(&under_d1).unwrap_err();
-        assert!(matches!(err, Error::Downgrade(_)), "{err}");
-
-        // Re-seeing the current answer is fine.
-        resolver.note_rank(&under_d2).expect("same rank is not a downgrade");
+            resolver.note_rank(&tombstone).expect("retirement accepted");
+            let err = resolver.note_rank(&live).unwrap_err();
+            assert!(matches!(err, Error::Downgrade(_)), "{err}");
+        }
     }
 
     #[test]
-    fn a_server_cannot_follow_a_revocation_with_a_live_record() {
+    fn a_server_cannot_walk_a_serial_backwards() {
         let resolver = offline_resolver();
-        let identity = generate();
-        let id_pub = public_of(&identity);
+        let node = generate();
+        let key = public_of(&node);
 
-        let revocation = Record::revoked(id_pub, 1, None, "stolen")
-            .sign(&identity)
-            .unwrap();
-        let live = Record::live(id_pub, u64::MAX, 300, endpoints())
-            .sign(&identity)
-            .unwrap();
+        let newer = Record::live(key, None, 9, 300, endpoints()).sign(&node).unwrap();
+        let older = Record::live(key, None, 4, 300, endpoints()).sign(&node).unwrap();
 
-        resolver.note_rank(&revocation).expect("revocation accepted");
-        let err = resolver.note_rank(&live).unwrap_err();
+        resolver.note_rank(&newer).expect("first answer is accepted");
+        let err = resolver.note_rank(&older).unwrap_err();
         assert!(matches!(err, Error::Downgrade(_)), "{err}");
+        resolver.note_rank(&newer).expect("same rank is not a downgrade");
     }
 
     #[test]
@@ -419,7 +523,9 @@ mod tests {
         let key = public_of(&node);
 
         for serial in 1..5 {
-            let record = Record::live(key, serial, 300, endpoints()).sign(&node).unwrap();
+            let record = Record::live(key, None, serial, 300, endpoints())
+                .sign(&node)
+                .unwrap();
             resolver.note_rank(&record).expect("serials only go up");
         }
     }

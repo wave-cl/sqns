@@ -41,6 +41,12 @@ pub enum Error {
     #[error("refusing a downgrade for {0}: a newer authority for this key was already seen")]
     Downgrade(String),
 
+    #[error("key {key} was superseded by {successor}")]
+    Superseded { key: String, successor: String },
+
+    #[error("supersede chain: {0}")]
+    SupersedeChain(String),
+
     #[error("delegation error: {0}")]
     Delegation(String),
 

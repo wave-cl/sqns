@@ -11,7 +11,7 @@ use sqns_core::error::{Error, Result};
 use sqns_core::key::{self, PubKey};
 use sqns_core::record::{
     DEFAULT_DELEGATION_LIFETIME, Delegation, DelegationFile, Endpoint, MAX_DELEGATION_LIFETIME,
-    Record, RecordBody, now_unix,
+    Record, RecordBody, SignedRecord, now_unix,
 };
 
 /// Environment variable holding one or more server addresses.
@@ -85,11 +85,11 @@ enum Command {
     },
     /// Show server counters.
     Status,
-    /// Issue a delegation from an offline identity key to a service key.
+    /// Issue a delegation from an offline identity key over a service key.
     ///
-    /// Run this where the identity key lives; it touches no network. Raise
-    /// --serial on every rotation: a higher serial retires the previous service
-    /// key and every record it signed.
+    /// Run this where the identity key lives; it touches no network. One
+    /// identity may issue as many service keys as it likes, and each resolves
+    /// on its own.
     Delegate {
         /// Hex Ed25519 seed file for the identity key.
         #[arg(short, long, value_name = "FILE")]
@@ -98,9 +98,6 @@ enum Command {
         /// its private seed file.
         #[arg(long, value_name = "KEY|FILE")]
         service_key: String,
-        /// Delegation serial. Must increase on every rotation.
-        #[arg(long)]
-        serial: u64,
         /// Days the delegation stays valid.
         #[arg(long, default_value_t = DEFAULT_DELEGATION_LIFETIME / 86_400)]
         days: u64,
@@ -108,20 +105,49 @@ enum Command {
         #[arg(short, long, value_name = "FILE")]
         out: PathBuf,
     },
-    /// Permanently revoke an identity. This cannot be undone.
-    Revoke {
-        /// Hex Ed25519 seed file for the identity key being revoked.
-        #[arg(short, long, value_name = "FILE")]
-        key_file: PathBuf,
-        /// The operator's new identity, recorded as an unverifiable hint.
+    /// Retire a service key and forward lookups to its replacement.
+    Supersede {
+        /// The service key being retired.
         #[arg(long, value_name = "KEY")]
-        successor: Option<String>,
+        old_key: String,
+        /// The service key that replaces it.
+        #[arg(long, value_name = "KEY")]
+        new_key: String,
+        /// Identity key that issued the old service key.
+        #[arg(short, long, value_name = "FILE", conflicts_with = "key_file")]
+        identity_key: Option<PathBuf>,
+        /// The old service key's own seed, for a key with no identity.
+        #[arg(short, long, value_name = "FILE")]
+        key_file: Option<PathBuf>,
+        /// Why the key is being retired.
+        #[arg(long, default_value = "rotated")]
+        reason: String,
+    },
+    /// Permanently revoke a service key. This cannot be undone.
+    Revoke {
+        /// The service key to revoke. Omit with --all.
+        #[arg(long, value_name = "KEY")]
+        key: Option<String>,
+        /// Revoke every service key this identity has issued.
+        #[arg(long, conflicts_with = "key")]
+        all: bool,
+        /// Identity key that issued the service key.
+        #[arg(short, long, value_name = "FILE", conflicts_with = "key_file")]
+        identity_key: Option<PathBuf>,
+        /// The service key's own seed, for a key with no identity.
+        #[arg(short, long, value_name = "FILE")]
+        key_file: Option<PathBuf>,
         /// Why the key is being revoked.
         #[arg(long, default_value = "revoked by the key holder")]
         reason: String,
         /// Skip the confirmation prompt.
         #[arg(long)]
         yes: bool,
+    },
+    /// List the service keys an identity has issued.
+    Identity {
+        /// The identity's base58 public key, or a path to its seed file.
+        key: String,
     },
     /// Generate a keypair.
     Keygen {
@@ -159,10 +185,9 @@ fn run() -> Result<()> {
         Command::Delegate {
             identity_key,
             service_key,
-            serial,
             days,
             out,
-        } => return delegate(identity_key, service_key, *serial, *days, out),
+        } => return delegate(identity_key, service_key, *days, out),
         _ => {}
     }
 
@@ -176,9 +201,23 @@ async fn run_async(command: Command, server: ServerArgs) -> Result<()> {
         Command::Lookup { key } => {
             let key = key.parse::<PubKey>()?;
             let resolver = build_resolver(&server)?;
-            match resolver.lookup(&key).await? {
-                Some(rec) => print_record(&rec),
-                None => return Err(Error::Unpublished(key.to_string())),
+            let Some(rec) = resolver.lookup(&key).await? else {
+                return Err(Error::Unpublished(key.to_string()));
+            };
+            print_record(&rec);
+
+            // A retired key is only half the story; show where it leads.
+            if rec.record.successor().is_some() {
+                match resolver.resolve_service(&key).await {
+                    Ok(location) => {
+                        println!();
+                        println!("--- resolves to {} ---", location.key);
+                        if let Some(rec) = resolver.lookup(&location.key).await? {
+                            print_record(&rec);
+                        }
+                    }
+                    Err(e) => println!("\ncould not follow the forward: {e}"),
+                }
             }
             Ok(())
         }
@@ -186,11 +225,18 @@ async fn run_async(command: Command, server: ServerArgs) -> Result<()> {
         Command::Resolve { key } => {
             let key = key.parse::<PubKey>()?;
             let resolver = build_resolver(&server)?;
-            let endpoints = resolver.resolve(&key).await?;
-            if endpoints.is_empty() {
+            let location = resolver.resolve_service(&key).await?;
+            if location.is_stale() {
+                // stdout stays a clean endpoint list for scripts.
+                eprintln!(
+                    "sqns: {key} has been rotated; it now resolves to {}",
+                    location.key
+                );
+            }
+            if location.endpoints.is_empty() {
                 return Err(Error::Unpublished(format!("{key} (withdrawn)")));
             }
-            for ep in endpoints {
+            for ep in location.endpoints {
                 println!("{}", ep.authority());
             }
             Ok(())
@@ -212,13 +258,7 @@ async fn run_async(command: Command, server: ServerArgs) -> Result<()> {
             let publisher = std::sync::Arc::new(match &delegation {
                 Some(path) => {
                     let file = load_delegation(path)?;
-                    Publisher::delegated(
-                        file.identity,
-                        signing_key,
-                        file.delegation,
-                        parsed,
-                        ttl,
-                    )?
+                    Publisher::delegated(signing_key, file.delegation, parsed, ttl)?
                 }
                 None => Publisher::new(signing_key, parsed, ttl),
             });
@@ -228,11 +268,8 @@ async fn run_async(command: Command, server: ServerArgs) -> Result<()> {
                 "published {} serial {serial}, expires in {ttl}s",
                 publisher.key()
             );
-            if let Some(d) = publisher.delegation() {
-                println!(
-                    "  dialed as {} under delegation {}",
-                    d.service_key, d.serial
-                );
+            if let Some(identity) = publisher.identity() {
+                println!("  issued by identity {identity}");
             }
             if keepalive {
                 println!(
@@ -269,12 +306,58 @@ async fn run_async(command: Command, server: ServerArgs) -> Result<()> {
             Ok(())
         }
 
-        Command::Revoke {
+        Command::Supersede {
+            old_key,
+            new_key,
+            identity_key,
             key_file,
-            successor,
+            reason,
+        } => {
+            supersede(
+                &old_key,
+                &new_key,
+                identity_key.as_deref(),
+                key_file.as_deref(),
+                &reason,
+                &server,
+            )
+            .await
+        }
+
+        Command::Revoke {
+            key,
+            all,
+            identity_key,
+            key_file,
             reason,
             yes,
-        } => revoke(&key_file, successor, &reason, yes, &server).await,
+        } => {
+            revoke(
+                key.as_deref(),
+                all,
+                identity_key.as_deref(),
+                key_file.as_deref(),
+                &reason,
+                yes,
+                &server,
+            )
+            .await
+        }
+
+        Command::Identity { key } => {
+            let identity = read_pubkey(&key)?;
+            let resolver = build_resolver(&server)?;
+            let records = resolver.lookup_identity(&identity).await?;
+            if records.is_empty() {
+                println!("{identity} has no service keys on this server");
+                return Ok(());
+            }
+            println!("{identity} has issued {} service key(s):", records.len());
+            for rec in records {
+                println!("  {}  {}", rec.key(), describe_state(&rec));
+            }
+            Ok(())
+        }
 
         Command::Keygen { .. } | Command::Delegate { .. } => {
             unreachable!("handled before the runtime starts")
@@ -297,29 +380,9 @@ fn keygen(out: &Path, force: bool) -> Result<()> {
 }
 
 /// Issue a delegation. Offline: no network, no server needed.
-fn delegate(
-    identity_path: &Path,
-    service_key: &str,
-    serial: u64,
-    days: u64,
-    out: &Path,
-) -> Result<()> {
+fn delegate(identity_path: &Path, service_key: &str, days: u64, out: &Path) -> Result<()> {
     let identity = key::load_secret_file(identity_path)?;
-    let identity_pub = key::public_of(&identity);
-
-    // Accept the service key as a base58 public key or as a private seed file.
-    let service_pub = match service_key.parse::<PubKey>() {
-        Ok(k) => k,
-        Err(_) => {
-            let path = Path::new(service_key);
-            if !path.exists() {
-                return Err(Error::Key(format!(
-                    "'{service_key}' is neither a base58 public key nor an existing file"
-                )));
-            }
-            key::public_of(&key::load_secret_file(path)?)
-        }
-    };
+    let service_pub = read_pubkey(service_key)?;
 
     let lifetime = days.saturating_mul(86_400);
     if lifetime == 0 || lifetime > MAX_DELEGATION_LIFETIME {
@@ -328,17 +391,18 @@ fn delegate(
             MAX_DELEGATION_LIFETIME / 86_400
         )));
     }
-    let not_after = now_unix() + lifetime;
-    let delegation = Delegation::issue(&identity, service_pub, serial, not_after)?;
-    std::fs::write(out, DelegationFile::new(identity_pub, delegation).encode())?;
+    let delegation = Delegation::issue(&identity, &service_pub, now_unix() + lifetime);
+    std::fs::write(out, DelegationFile::new(service_pub, delegation).encode())?;
 
     println!("delegation:  {}", out.display());
-    println!("identity:    {identity_pub}");
+    println!("identity:    {}", key::public_of(&identity));
     println!("service key: {service_pub}");
-    println!("serial:      {serial}");
     println!("valid for:   {days} days");
     println!();
-    println!("Publish with: sqns publish --key-file <service seed> --delegation {}", out.display());
+    println!(
+        "Publish with: sqns publish --key-file <service seed> --delegation {}",
+        out.display()
+    );
     Ok(())
 }
 
@@ -348,40 +412,137 @@ fn load_delegation(path: &Path) -> Result<DelegationFile> {
     DelegationFile::decode(&bytes)
 }
 
-/// Revoke an identity permanently.
+/// Read a base58 public key, or derive one from a private seed file.
+fn read_pubkey(value: &str) -> Result<PubKey> {
+    if let Ok(k) = value.parse::<PubKey>() {
+        return Ok(k);
+    }
+    let path = Path::new(value);
+    if !path.exists() {
+        return Err(Error::Key(format!(
+            "'{value}' is neither a base58 public key nor an existing file"
+        )));
+    }
+    Ok(key::public_of(&key::load_secret_file(path)?))
+}
+
+/// The signing key and delegation that retiring `service_key` calls for.
+///
+/// A delegated key is retired by its identity, which mints a fresh delegation
+/// over the key to carry its authority in the record. A key with no identity
+/// retires itself.
+fn retirement_authority(
+    service_key: &PubKey,
+    identity_path: Option<&Path>,
+    key_path: Option<&Path>,
+) -> Result<(ed25519_dalek::SigningKey, Option<Delegation>)> {
+    match (identity_path, key_path) {
+        (Some(path), _) => {
+            let identity = key::load_secret_file(path)?;
+            let delegation =
+                Delegation::issue(&identity, service_key, now_unix() + DEFAULT_DELEGATION_LIFETIME);
+            Ok((identity, Some(delegation)))
+        }
+        (None, Some(path)) => {
+            let sk = key::load_secret_file(path)?;
+            if key::public_of(&sk) != *service_key {
+                return Err(Error::Key(format!(
+                    "{} holds {}, not {service_key}",
+                    path.display(),
+                    key::public_of(&sk)
+                )));
+            }
+            Ok((sk, None))
+        }
+        (None, None) => Err(Error::Key(
+            "pass --identity-key (the identity that issued the key) or --key-file (the key itself)"
+                .into(),
+        )),
+    }
+}
+
+/// Retire a service key, forwarding lookups to its replacement.
+async fn supersede(
+    old_key: &str,
+    new_key: &str,
+    identity_path: Option<&Path>,
+    key_path: Option<&Path>,
+    reason: &str,
+    server: &ServerArgs,
+) -> Result<()> {
+    let old = read_pubkey(old_key)?;
+    let new = read_pubkey(new_key)?;
+    let (signing_key, delegation) = retirement_authority(&old, identity_path, key_path)?;
+
+    let record = Record::superseded(old, delegation, now_unix(), new, reason).sign(&signing_key)?;
+    let resolver = build_resolver(server)?;
+    resolver.publish(&record).await?;
+
+    println!("superseded {old}");
+    println!("       now {new}");
+    println!();
+    println!("Lookups of the old key now return the new one and its endpoints.");
+    println!("Nothing more will be accepted for the old key.");
+    Ok(())
+}
+
+/// Permanently revoke one service key, or every key an identity issued.
 async fn revoke(
-    key_path: &Path,
-    successor: Option<String>,
+    key_arg: Option<&str>,
+    all: bool,
+    identity_path: Option<&Path>,
+    key_path: Option<&Path>,
     reason: &str,
     yes: bool,
     server: &ServerArgs,
 ) -> Result<()> {
-    let identity = key::load_secret_file(key_path)?;
-    let identity_pub = key::public_of(&identity);
-    let successor = successor
-        .as_deref()
-        .map(str::parse::<PubKey>)
-        .transpose()?;
+    let resolver = build_resolver(server)?;
+
+    let targets: Vec<PubKey> = if all {
+        let path = identity_path.ok_or_else(|| {
+            Error::Key("--all needs --identity-key: it revokes what that identity issued".into())
+        })?;
+        let identity = key::public_of(&key::load_secret_file(path)?);
+        resolver
+            .lookup_identity(&identity)
+            .await?
+            .iter()
+            .filter(|rec| !rec.record.is_terminal())
+            .map(|rec| rec.key())
+            .collect()
+    } else {
+        let value = key_arg
+            .ok_or_else(|| Error::Key("pass --key <service key>, or --all with --identity-key".into()))?;
+        vec![read_pubkey(value)?]
+    };
+
+    if targets.is_empty() {
+        println!("nothing to revoke");
+        return Ok(());
+    }
 
     if !yes {
-        println!("This permanently revokes {identity_pub}.");
-        println!("No record for this key will ever be accepted again, by any server that");
-        println!("holds the revocation. It cannot be undone.");
-        print!("Type the key's first 8 characters to confirm: ");
+        println!("This permanently revokes {} service key(s):", targets.len());
+        for key in &targets {
+            println!("  {key}");
+        }
+        println!("No record for them will ever be accepted again, by any server that holds");
+        println!("the revocation. It cannot be undone.");
+        print!("Type 'revoke' to confirm: ");
         std::io::Write::flush(&mut std::io::stdout())?;
         let mut answer = String::new();
         std::io::stdin().read_line(&mut answer)?;
-        if answer.trim() != identity_pub.short() {
+        if answer.trim() != "revoke" {
             return Err(Error::Key("revocation cancelled".into()));
         }
     }
 
-    let record = Record::revoked(identity_pub, now_unix(), successor, reason).sign(&identity)?;
-    let resolver = build_resolver(server)?;
-    let serial = resolver.publish(&record).await?;
-    println!("revoked {identity_pub} serial {serial}");
-    if let Some(s) = successor {
-        println!("successor hint recorded: {s}");
+    for target in targets {
+        let (signing_key, delegation) = retirement_authority(&target, identity_path, key_path)?;
+        let record =
+            Record::revoked(target, delegation, now_unix(), reason).sign(&signing_key)?;
+        resolver.publish(&record).await?;
+        println!("revoked {target}");
     }
     Ok(())
 }
@@ -418,57 +579,67 @@ fn build_resolver(args: &ServerArgs) -> Result<Resolver> {
     })
 }
 
-fn print_record(record: &sqns_core::record::SignedRecord) {
+/// One-line state of a record, for listings.
+fn describe_state(record: &SignedRecord) -> String {
+    let rec = &record.record;
+    match &rec.body {
+        RecordBody::Superseded { successor, .. } => format!("superseded by {successor}"),
+        RecordBody::Revoked { reason } => format!("revoked ({reason})"),
+        RecordBody::Live { endpoints } if endpoints.is_empty() => "withdrawn".to_string(),
+        RecordBody::Live { endpoints } => format!("live, {} endpoint(s)", endpoints.len()),
+    }
+}
+
+fn print_record(record: &SignedRecord) {
     let rec = &record.record;
     let now = now_unix();
     println!("key:      {}", rec.key);
+    match rec.identity() {
+        Some(identity) => println!("identity: {identity}"),
+        None => println!("identity: none — this key stands on its own"),
+    }
     println!("serial:   {}", rec.serial);
     println!("issued:   {}s ago", now.saturating_sub(rec.issued_at));
 
-    if let RecordBody::Revoked { successor, reason } = &rec.body {
-        println!("status:   REVOKED — this identity is permanently dead");
-        println!("reason:   {reason}");
-        match successor {
-            Some(s) => {
-                println!("successor: {s}");
-                println!();
-                println!("The successor is a hint from the revocation itself, which whoever");
-                println!("holds the revoked key could have written. Confirm it out of band");
-                println!("before trusting it.");
-            }
-            None => println!("successor: none recorded"),
+    match &rec.body {
+        RecordBody::Superseded { successor, reason } => {
+            println!("status:   SUPERSEDED — this key is retired ({reason})");
+            println!("now use:  {successor}");
+            println!();
+            println!("Resolving the old key follows this forward automatically; update any");
+            println!("pinned copy of it to the new key.");
         }
-        return;
-    }
-
-    println!(
-        "expires:  in {} (ttl {}s)",
-        format_duration(rec.remaining(now)),
-        rec.ttl
-    );
-    match rec.delegation() {
-        Some(d) => {
-            println!("dial key: {} (delegated)", d.service_key);
+        RecordBody::Revoked { reason } => {
+            println!("status:   REVOKED — this key is permanently dead");
+            println!("reason:   {reason}");
+        }
+        RecordBody::Live { endpoints } => {
             println!(
-                "          delegation {} valid for {}",
-                d.serial,
-                format_duration(d.not_after.saturating_sub(now))
+                "expires:  in {} (ttl {}s)",
+                format_duration(rec.remaining(now)),
+                rec.ttl
             );
+            if let Some(d) = &rec.delegation {
+                println!(
+                    "delegated until {} ({})",
+                    format_duration(d.not_after.saturating_sub(now)),
+                    d.identity
+                );
+            }
+            if endpoints.is_empty() {
+                println!("endpoints: none — this key is withdrawn");
+                return;
+            }
+            println!("endpoints:");
+            for ep in order_endpoints(rec) {
+                println!(
+                    "  {:<40} priority={:<5} weight={}",
+                    ep.authority(),
+                    ep.priority,
+                    ep.weight
+                );
+            }
         }
-        None => println!("dial key: {} (the identity itself)", rec.key),
-    }
-    if rec.is_withdrawal() {
-        println!("endpoints: none — this key is withdrawn");
-        return;
-    }
-    println!("endpoints:");
-    for ep in order_endpoints(rec) {
-        println!(
-            "  {:<40} priority={:<5} weight={}",
-            ep.authority(),
-            ep.priority,
-            ep.weight
-        );
     }
 }
 
@@ -484,13 +655,82 @@ fn format_duration(secs: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::Cli;
-    use clap::CommandFactory;
+    use super::{Cli, Command};
+    use clap::{CommandFactory, Parser};
 
     /// Catches clashing short flags and other command wiring mistakes, which
     /// clap only asserts on at runtime.
     #[test]
     fn the_command_line_is_well_formed() {
         Cli::command().debug_assert();
+    }
+
+    /// Actually parses each command. `debug_assert` does not catch an argument
+    /// whose id collides with a global one — that only surfaces when the value
+    /// is read back, and then it panics in the user's face.
+    #[test]
+    fn every_command_parses_and_reads_its_arguments() {
+        let cases: Vec<Vec<&str>> = vec![
+            vec!["sqns", "lookup", "KEY"],
+            vec!["sqns", "resolve", "KEY", "--server", "sqc://h:1/K"],
+            vec!["sqns", "identity", "KEY"],
+            vec!["sqns", "publish", "--key-file", "k", "-e", "1.2.3.4:5"],
+            vec!["sqns", "publish", "--key-file", "k", "-D", "d.bin", "-e", "1.2.3.4:5"],
+            vec!["sqns", "withdraw", "--key-file", "k"],
+            vec!["sqns", "status", "--identity", "id.key"],
+            vec!["sqns", "keygen", "--out", "k"],
+            vec!["sqns", "delegate", "--identity-key", "i", "--service-key", "s", "--out", "d"],
+            vec!["sqns", "supersede", "--old-key", "A", "--new-key", "B", "--identity-key", "i"],
+            vec!["sqns", "revoke", "--key", "A", "--identity-key", "i"],
+            vec!["sqns", "revoke", "--all", "--identity-key", "i"],
+        ];
+        for args in cases {
+            let cli = Cli::try_parse_from(&args)
+                .unwrap_or_else(|e| panic!("{args:?} did not parse: {e}"));
+            // Reading the arguments back is what trips an id collision.
+            let _ = format!("{:?}", cli.server.servers);
+            let _ = format!("{:?}", cli.server.identity);
+            describe_command(&cli.command);
+        }
+    }
+
+    /// Touch every field of the parsed command, so a bad id is caught here.
+    fn describe_command(command: &Command) -> String {
+        match command {
+            Command::Lookup { key } | Command::Resolve { key } | Command::Identity { key } => {
+                key.clone()
+            }
+            Command::Publish {
+                key_file,
+                delegation,
+                endpoints,
+                ttl,
+                keepalive,
+            } => format!("{key_file:?}{delegation:?}{endpoints:?}{ttl}{keepalive}"),
+            Command::Withdraw { key_file, ttl } => format!("{key_file:?}{ttl}"),
+            Command::Status => "status".into(),
+            Command::Keygen { out, force } => format!("{out:?}{force}"),
+            Command::Delegate {
+                identity_key,
+                service_key,
+                days,
+                out,
+            } => format!("{identity_key:?}{service_key}{days}{out:?}"),
+            Command::Supersede {
+                old_key,
+                new_key,
+                identity_key,
+                key_file,
+                reason,
+            } => format!("{old_key}{new_key}{identity_key:?}{key_file:?}{reason}"),
+            Command::Revoke {
+                key,
+                all,
+                identity_key,
+                key_file,
+                reason,
+                yes,
+            } => format!("{key:?}{all}{identity_key:?}{key_file:?}{reason}{yes}"),
+        }
     }
 }

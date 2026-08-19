@@ -20,5 +20,7 @@ pub mod select;
 
 pub use cache::Cache;
 pub use publisher::{DEFAULT_TTL, Publisher};
-pub use resolver::{Resolver, ResolverConfig, ServiceLocation, hex_seed};
+pub use resolver::{
+    MAX_SUPERSEDE_HOPS, Resolver, ResolverConfig, ServiceLocation, hex_seed,
+};
 pub use select::order_endpoints;

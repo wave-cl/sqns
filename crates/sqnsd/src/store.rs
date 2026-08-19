@@ -9,13 +9,16 @@
 //! Two pieces of state outlive the records themselves, because both exist to
 //! stop a stolen key from coming back:
 //!
-//! - **Revocations are terminal.** Once a key is revoked, no later record for
-//!   it is ever accepted, and the tombstone never expires or gets swept.
-//! - **Delegation marks.** The highest delegation serial seen for a key is
-//!   remembered even after its records expire, so a service key retired by a
-//!   newer delegation cannot publish again once the old record lapses.
+//! - **Retirement is terminal.** Once a key is superseded or revoked, no later
+//!   record for it is ever accepted, and the tombstone never expires or gets
+//!   swept.
+//! - **Identity bindings.** The identity that issued a service key is pinned
+//!   from that key's first record and kept for good. Only that identity can
+//!   retire the key, and every later record for it must carry a delegation from
+//!   it — so a thief holding the key cannot re-bind it to an identity of their
+//!   own, nor drop the delegation to retire the key themselves.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -29,7 +32,7 @@ use sqns_core::record::{MAX_CLOCK_SKEW, SignedRecord, now_unix};
 
 /// Snapshot file magic and format version.
 const SNAPSHOT_MAGIC: &[u8; 6] = b"SQNSDB";
-const SNAPSHOT_VERSION: u8 = 2;
+const SNAPSHOT_VERSION: u8 = 3;
 
 /// What [`Store::put`] did with a record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,9 +52,11 @@ impl PutOutcome {
 /// In-memory record set with an optional on-disk snapshot.
 pub struct Store {
     records: RwLock<HashMap<PubKey, SignedRecord>>,
-    /// Highest delegation serial ever accepted for a key. Outlives the record
-    /// it came from, so expiry cannot reopen a retired service key.
-    delegation_marks: RwLock<HashMap<PubKey, u64>>,
+    /// The identity that issued each service key, pinned on first sight and
+    /// kept even after the key's records expire.
+    bindings: RwLock<HashMap<PubKey, PubKey>>,
+    /// Reverse of `bindings`: every service key an identity has issued.
+    identity_index: RwLock<HashMap<PubKey, BTreeSet<PubKey>>>,
     path: Option<PathBuf>,
     /// Bumped on every change, so the snapshot writer can skip idle intervals.
     revision: AtomicU64,
@@ -61,7 +66,8 @@ impl Store {
     pub fn new(path: Option<PathBuf>) -> Self {
         Self {
             records: RwLock::new(HashMap::new()),
-            delegation_marks: RwLock::new(HashMap::new()),
+            bindings: RwLock::new(HashMap::new()),
+            identity_index: RwLock::new(HashMap::new()),
             path,
             revision: AtomicU64::new(0),
         }
@@ -83,7 +89,7 @@ impl Store {
         // A snapshot we cannot read is not a reason to refuse to start: an
         // empty server recovers its records from peers, a dead one recovers
         // nothing.
-        let (records, marks) = match decode_snapshot(&bytes) {
+        let (records, bindings) = match decode_snapshot(&bytes) {
             Ok(loaded) => loaded,
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e,
@@ -91,7 +97,9 @@ impl Store {
                 return Ok(store);
             }
         };
-        store.delegation_marks.write().unwrap().extend(marks);
+        for (service_key, identity) in bindings {
+            store.bind(service_key, identity);
+        }
         let now = now_unix();
         let (mut loaded, mut dropped) = (0usize, 0usize);
         for rec in records {
@@ -128,47 +136,58 @@ impl Store {
         }
         // Authority that has run out is no authority: a service key whose
         // delegation lapsed cannot publish, even though its signature is good.
-        if let Some(d) = record.record.delegation()
+        if let Some(d) = &record.record.delegation
             && d.is_expired(now)
+            && !record.record.is_terminal()
         {
             return Err(Error::Delegation(format!(
-                "delegation to {} expired {}s ago",
-                d.service_key,
+                "the delegation over {} from {} expired {}s ago",
+                record.key(),
+                d.identity,
                 now - d.not_after
             )));
         }
 
         let key = record.key();
-        let delegation_serial = record.record.delegation_serial();
 
         let mut records = self.records.write().unwrap();
-        let mut marks = self.delegation_marks.write().unwrap();
 
-        // A revoked key is dead for good, whatever the record claims.
+        // A retired key is finished, whatever the new record claims.
         if let Some(held) = records.get(&key)
-            && let Some(revoked) = held.revocation_error()
+            && let Some(retired) = retirement_error(held)
         {
-            return Err(revoked);
+            return Err(retired);
         }
-        // A service key retired by a newer delegation stays retired, even once
-        // the record that retired it has expired and been swept.
-        if let Some(mark) = marks.get(&key)
-            && delegation_serial < *mark
-            && !record.record.is_revoked()
-        {
-            return Err(Error::Delegation(format!(
-                "{key} has delegation {mark}; this record was signed under {delegation_serial}"
-            )));
+
+        // Once a key is bound to an identity it stays bound: every later record
+        // must come under a delegation from that same identity. Without this a
+        // thief holding the key could simply drop the delegation and retire the
+        // key itself, or re-bind it to an identity they control.
+        if let Some(bound) = self.bindings.read().unwrap().get(&key).copied() {
+            match record.record.identity() {
+                Some(identity) if identity == bound => {}
+                Some(identity) => {
+                    return Err(Error::Delegation(format!(
+                        "{key} belongs to identity {bound}, but this record claims {identity}"
+                    )));
+                }
+                None => {
+                    return Err(Error::Delegation(format!(
+                        "{key} belongs to identity {bound}; a record for it must carry that delegation"
+                    )));
+                }
+            }
         }
 
         match records.get(&key) {
             Some(held) if !record.record.supersedes(&held.record) => Ok(PutOutcome::Stale),
             _ => {
-                marks
-                    .entry(key)
-                    .and_modify(|m| *m = (*m).max(delegation_serial))
-                    .or_insert(delegation_serial);
+                let identity = record.record.identity();
                 records.insert(key, record);
+                drop(records);
+                if let Some(identity) = identity {
+                    self.bind(key, identity);
+                }
                 self.revision.fetch_add(1, Ordering::Relaxed);
                 Ok(PutOutcome::Stored)
             }
@@ -184,6 +203,46 @@ impl Store {
             .get(key)
             .filter(|rec| !rec.record.is_expired(now))
             .cloned()
+    }
+
+    /// Pin a service key to the identity that issued it.
+    fn bind(&self, service_key: PubKey, identity: PubKey) {
+        self.bindings
+            .write()
+            .unwrap()
+            .entry(service_key)
+            .or_insert(identity);
+        self.identity_index
+            .write()
+            .unwrap()
+            .entry(identity)
+            .or_default()
+            .insert(service_key);
+    }
+
+    /// The identity that issued `service_key`, if one is known.
+    pub fn identity_of(&self, service_key: &PubKey) -> Option<PubKey> {
+        self.bindings.read().unwrap().get(service_key).copied()
+    }
+
+    /// Every record this server holds for keys `identity` has issued.
+    ///
+    /// Completeness is not something a caller can verify — a server can leave a
+    /// key out — but resolution never depends on this; it is for tooling and
+    /// for an operator auditing their own keys.
+    pub fn identity_records(&self, identity: &PubKey, limit: usize) -> Vec<SignedRecord> {
+        let index = self.identity_index.read().unwrap();
+        let Some(keys) = index.get(identity) else {
+            return Vec::new();
+        };
+        let records = self.records.read().unwrap();
+        let now = now_unix();
+        keys.iter()
+            .filter_map(|key| records.get(key))
+            .filter(|rec| !rec.record.is_expired(now))
+            .take(limit)
+            .cloned()
+            .collect()
     }
 
     /// Unexpired records issued at or after `since`, oldest first.
@@ -248,8 +307,8 @@ impl Store {
         }
         let bytes = {
             let records = self.records.read().unwrap();
-            let marks = self.delegation_marks.read().unwrap();
-            encode_snapshot(records.values(), &marks)
+            let bindings = self.bindings.read().unwrap();
+            encode_snapshot(records.values(), &bindings)
         };
 
         let tmp = path.with_extension("tmp");
@@ -262,30 +321,42 @@ impl Store {
     }
 }
 
+/// The error a held record's retirement should be reported as, if it retires
+/// its key.
+fn retirement_error(held: &SignedRecord) -> Option<Error> {
+    if let Some(successor) = held.record.successor() {
+        return Some(Error::Superseded {
+            key: held.key().to_string(),
+            successor: successor.to_string(),
+        });
+    }
+    held.revocation_error()
+}
+
 fn encode_snapshot<'a>(
     records: impl ExactSizeIterator<Item = &'a SignedRecord>,
-    marks: &HashMap<PubKey, u64>,
+    bindings: &HashMap<PubKey, PubKey>,
 ) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(16 + records.len() * 128 + marks.len() * 40);
+    let mut buf = Vec::with_capacity(16 + records.len() * 128 + bindings.len() * 64);
     buf.extend_from_slice(SNAPSHOT_MAGIC);
     buf.push(SNAPSHOT_VERSION);
     buf.extend_from_slice(&(records.len() as u32).to_be_bytes());
     for rec in records {
         buf.extend_from_slice(&rec.encode());
     }
-    // Marks are written after the records, and deliberately kept even for keys
-    // whose records have lapsed.
-    buf.extend_from_slice(&(marks.len() as u32).to_be_bytes());
-    let mut sorted: Vec<_> = marks.iter().collect();
+    // Bindings are written after the records, and deliberately kept even for
+    // keys whose records have lapsed.
+    buf.extend_from_slice(&(bindings.len() as u32).to_be_bytes());
+    let mut sorted: Vec<_> = bindings.iter().collect();
     sorted.sort_by_key(|(key, _)| **key);
-    for (key, serial) in sorted {
-        buf.extend_from_slice(key.as_bytes());
-        buf.extend_from_slice(&serial.to_be_bytes());
+    for (service_key, identity) in sorted {
+        buf.extend_from_slice(service_key.as_bytes());
+        buf.extend_from_slice(identity.as_bytes());
     }
     buf
 }
 
-type Snapshot = (Vec<SignedRecord>, HashMap<PubKey, u64>);
+type Snapshot = (Vec<SignedRecord>, HashMap<PubKey, PubKey>);
 
 fn decode_snapshot(bytes: &[u8]) -> Result<Snapshot> {
     let mut r = Reader::new(bytes);
@@ -304,12 +375,15 @@ fn decode_snapshot(bytes: &[u8]) -> Result<Snapshot> {
     for _ in 0..count {
         records.push(SignedRecord::decode_from(&mut r)?);
     }
-    let mark_count = r.u32("snapshot mark count")? as usize;
-    let mut marks = HashMap::with_capacity(mark_count.min(4096));
-    for _ in 0..mark_count {
-        let key = PubKey::new(r.array::<32>("mark key")?);
-        marks.insert(key, r.u64("mark delegation serial")?);
+    let binding_count = r.u32("snapshot binding count")? as usize;
+    let mut bindings = HashMap::with_capacity(binding_count.min(4096));
+    for _ in 0..binding_count {
+        let service_key = PubKey::new(r.array::<32>("binding service key")?);
+        bindings.insert(
+            service_key,
+            PubKey::new(r.array::<32>("binding identity")?),
+        );
     }
     r.finish("snapshot")?;
-    Ok((records, marks))
+    Ok((records, bindings))
 }

@@ -71,7 +71,7 @@ fn endpoints() -> Vec<Endpoint> {
 }
 
 fn signed(sk: &SigningKey, serial: u64, endpoints: Vec<Endpoint>) -> SignedRecord {
-    Record::live(key::public_of(sk), serial, 300, endpoints)
+    Record::live(key::public_of(sk), None, serial, 300, endpoints)
         .sign(sk)
         .expect("sign")
 }
@@ -380,21 +380,28 @@ async fn a_restarted_publisher_replaces_its_own_earlier_record() {
 /// Alter an endpoint after signing, the way an attacker on the wire would.
 fn tamper_port(signed: &mut SignedRecord, port: u16) {
     match &mut signed.record.body {
-        RecordBody::Live { endpoints, .. } => endpoints[0].port = port,
-        RecordBody::Revoked { .. } => panic!("no endpoints to tamper with"),
+        RecordBody::Live { endpoints } => endpoints[0].port = port,
+        _ => panic!("no endpoints to tamper with"),
     }
 }
 
-// -- Key compromise --
+// -- Many services under one identity --
 
-fn delegation_for(identity: &SigningKey, service: &SigningKey, serial: u64) -> Delegation {
+fn issue(identity: &SigningKey, service: &SigningKey) -> Delegation {
     Delegation::issue(
         identity,
-        key::public_of(service),
-        serial,
+        &key::public_of(service),
         sqns_core::record::now_unix() + 86_400,
     )
-    .expect("issue delegation")
+}
+
+fn publisher_for(
+    service: &SigningKey,
+    delegation: &Delegation,
+    endpoints: Vec<Endpoint>,
+) -> sqns_client::Publisher {
+    sqns_client::Publisher::delegated(service.clone(), delegation.clone(), endpoints, 300)
+        .expect("publisher")
 }
 
 fn moved_endpoints(last_octet: u8) -> Vec<Endpoint> {
@@ -405,143 +412,341 @@ fn moved_endpoints(last_octet: u8) -> Vec<Endpoint> {
 }
 
 #[tokio::test]
-async fn a_stolen_service_key_is_shut_out_by_a_new_delegation() {
+async fn one_identity_runs_three_services_each_on_its_own_key() {
     let server = start_server(vec![]).await;
     let client = client_for(&[&server]);
 
-    // The identity key is offline; the node holds only `stolen` and d1.
+    // Three nodes, three private keys, one identity that issued them all.
     let identity = key::generate();
-    let stolen = key::generate();
-    let fresh = key::generate();
-    let d1 = delegation_for(&identity, &stolen, 1);
-    let d2 = delegation_for(&identity, &fresh, 2);
-    let id_pub = key::public_of(&identity);
+    let nodes: Vec<SigningKey> = (0..3).map(|_| key::generate()).collect();
+    let delegations: Vec<Delegation> = nodes.iter().map(|n| issue(&identity, n)).collect();
 
-    sqns_client::Publisher::delegated(id_pub, stolen.clone(), d1.clone(), endpoints(), 300)
-        .expect("publisher under d1")
-        .publish(&client)
+    for (i, (node, delegation)) in nodes.iter().zip(&delegations).enumerate() {
+        publisher_for(node, delegation, moved_endpoints(i as u8 + 1))
+            .publish(&client)
+            .await
+            .expect("each node publishes for itself");
+    }
+
+    // Each resolves by its own public key, and names the identity behind it.
+    for (i, node) in nodes.iter().enumerate() {
+        let location = client
+            .resolve_service(&key::public_of(node))
+            .await
+            .expect("resolve");
+        assert_eq!(location.key, key::public_of(node));
+        assert!(!location.is_stale());
+        assert_eq!(location.identity, Some(key::public_of(&identity)));
+        assert_eq!(location.endpoints, moved_endpoints(i as u8 + 1));
+    }
+
+    // The identity lists all three.
+    let listed = client
+        .lookup_identity(&key::public_of(&identity))
         .await
-        .expect("publish under d1");
-
-    let before = client.resolve_service(&id_pub).await.expect("resolve");
-    assert_eq!(before.identity, id_pub);
-    assert_eq!(before.service_key, key::public_of(&stolen));
-    assert!(before.is_delegated());
-
-    // The host is compromised. The operator brings the identity key out and
-    // delegates to a new service key.
-    sqns_client::Publisher::delegated(id_pub, fresh.clone(), d2, moved_endpoints(9), 300)
-        .expect("publisher under d2")
-        .publish(&client)
-        .await
-        .expect("publish under d2");
-
-    // The thief still holds the old service key and its delegation, and pushes
-    // the record serial as high as it will go.
-    let forged = Record::delegated(id_pub, u64::MAX, 300, d1, moved_endpoints(66))
-        .sign(&stolen)
-        .expect("the thief can still produce a valid signature");
-    let err = client.publish(&forged).await.unwrap_err();
-    assert!(
-        err.to_string().contains("delegation"),
-        "the old delegation must be refused, got: {err}"
-    );
-
-    // The identity that callers look up has not changed; the key they dial has.
-    let after = client.resolve_service(&id_pub).await.expect("resolve");
-    assert_eq!(after.identity, id_pub, "the looked-up key is stable");
-    assert_eq!(after.service_key, key::public_of(&fresh));
-    assert_eq!(after.delegation_serial, 2);
-    assert_eq!(after.endpoints, moved_endpoints(9));
+        .expect("identity lookup");
+    assert_eq!(listed.len(), 3);
 }
 
 #[tokio::test]
-async fn an_expired_delegation_stops_being_served() {
+async fn revoking_one_service_leaves_the_others_running() {
     let server = start_server(vec![]).await;
     let client = client_for(&[&server]);
     let identity = key::generate();
-    let service = key::generate();
-    let id_pub = key::public_of(&identity);
+    let nodes: Vec<SigningKey> = (0..3).map(|_| key::generate()).collect();
+    let delegations: Vec<Delegation> = nodes.iter().map(|n| issue(&identity, n)).collect();
+    for (node, delegation) in nodes.iter().zip(&delegations) {
+        publisher_for(node, delegation, endpoints())
+            .publish(&client)
+            .await
+            .unwrap();
+    }
 
-    // A delegation that lapsed an hour ago.
-    let lapsed = Delegation::issue(
-        &identity,
-        key::public_of(&service),
-        1,
-        sqns_core::record::now_unix() - 3600,
+    // Node 1's host is breached; the identity revokes just that key.
+    let doomed = key::public_of(&nodes[1]);
+    client
+        .publish(
+            &Record::revoked(doomed, Some(delegations[1].clone()), 99, "host breached")
+                .sign(&identity)
+                .unwrap(),
+        )
+        .await
+        .expect("revoke");
+
+    let err = client.resolve_service(&doomed).await.unwrap_err();
+    assert!(matches!(err, sqns_core::Error::Revoked { .. }), "{err}");
+    assert!(
+        client
+            .publish(&signed_under(&nodes[1], &delegations[1], u64::MAX))
+            .await
+            .is_err(),
+        "the thief cannot republish the revoked key"
+    );
+
+    // The siblings never noticed.
+    for i in [0, 2] {
+        let location = client
+            .resolve_service(&key::public_of(&nodes[i]))
+            .await
+            .expect("sibling still resolves");
+        assert_eq!(location.endpoints.len(), endpoints().len());
+        publisher_for(&nodes[i], &delegations[i], endpoints())
+            .publish(&client)
+            .await
+            .expect("and still publishes");
+    }
+}
+
+fn signed_under(service: &SigningKey, delegation: &Delegation, serial: u64) -> SignedRecord {
+    Record::live(
+        key::public_of(service),
+        Some(delegation.clone()),
+        serial,
+        300,
+        endpoints(),
     )
-    .unwrap();
-    let record = Record::delegated(id_pub, 1, 300, lapsed, endpoints())
-        .sign(&service)
+    .sign(service)
+    .expect("sign")
+}
+
+// -- Rotation: retiring a key and forwarding to its replacement --
+
+#[tokio::test]
+async fn a_rotated_key_forwards_to_its_replacement_in_one_exchange() {
+    let server = start_server(vec![]).await;
+    let client = client_for(&[&server]);
+    let identity = key::generate();
+    let old = key::generate();
+    let new = key::generate();
+    let d_old = issue(&identity, &old);
+    let d_new = issue(&identity, &new);
+
+    publisher_for(&old, &d_old, endpoints())
+        .publish(&client)
+        .await
+        .unwrap();
+    publisher_for(&new, &d_new, moved_endpoints(9))
+        .publish(&client)
+        .await
         .unwrap();
 
-    let err = client.publish(&record).await.unwrap_err();
+    // The identity retires the old key, naming its replacement.
+    client
+        .publish(
+            &Record::superseded(
+                key::public_of(&old),
+                Some(d_old.clone()),
+                99,
+                key::public_of(&new),
+                "rotated",
+            )
+            .sign(&identity)
+            .unwrap(),
+        )
+        .await
+        .expect("supersede");
+
+    // A client that only knows the old key still gets there, and learns what to
+    // pin from now on.
+    let location = client
+        .resolve_service(&key::public_of(&old))
+        .await
+        .expect("resolve follows the forward");
+    assert_eq!(location.requested, key::public_of(&old));
+    assert_eq!(location.key, key::public_of(&new));
+    assert!(location.is_stale(), "the caller's pinned key is out of date");
+    assert_eq!(location.superseded_from, vec![key::public_of(&old)]);
+    assert_eq!(location.endpoints, moved_endpoints(9));
+
+    // The thief still holding the old key can publish nothing.
+    let err = client
+        .publish(&signed_under(&old, &d_old, u64::MAX))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("superseded"), "{err}");
+}
+
+#[tokio::test]
+async fn a_chain_of_rotations_resolves_to_the_end() {
+    let server = start_server(vec![]).await;
+    let client = client_for(&[&server]);
+    let identity = key::generate();
+    let keys: Vec<SigningKey> = (0..3).map(|_| key::generate()).collect();
+    let delegations: Vec<Delegation> = keys.iter().map(|k| issue(&identity, k)).collect();
+
+    publisher_for(&keys[2], &delegations[2], moved_endpoints(3))
+        .publish(&client)
+        .await
+        .unwrap();
+    for hop in 0..2 {
+        client
+            .publish(
+                &Record::superseded(
+                    key::public_of(&keys[hop]),
+                    Some(delegations[hop].clone()),
+                    1,
+                    key::public_of(&keys[hop + 1]),
+                    "rotated",
+                )
+                .sign(&identity)
+                .unwrap(),
+            )
+            .await
+            .expect("supersede");
+    }
+
+    let location = client
+        .resolve_service(&key::public_of(&keys[0]))
+        .await
+        .expect("two hops resolve");
+    assert_eq!(location.key, key::public_of(&keys[2]));
+    assert_eq!(location.superseded_from.len(), 2);
+    assert_eq!(location.endpoints, moved_endpoints(3));
+}
+
+#[tokio::test]
+async fn a_rotation_cycle_is_refused_rather_than_followed() {
+    let server = start_server(vec![]).await;
+    let client = client_for(&[&server]);
+    let identity = key::generate();
+    let a = key::generate();
+    let b = key::generate();
+    let d_a = issue(&identity, &a);
+    let d_b = issue(&identity, &b);
+
+    for (from, delegation, to) in [(&a, &d_a, &b), (&b, &d_b, &a)] {
+        client
+            .publish(
+                &Record::superseded(
+                    key::public_of(from),
+                    Some(delegation.clone()),
+                    1,
+                    key::public_of(to),
+                    "loop",
+                )
+                .sign(&identity)
+                .unwrap(),
+            )
+            .await
+            .expect("publish");
+    }
+
+    let err = client
+        .resolve_service(&key::public_of(&a))
+        .await
+        .unwrap_err();
     assert!(
-        matches!(err, sqns_core::Error::Delegation(_)),
-        "an expired delegation must not publish, got: {err}"
+        matches!(err, sqns_core::Error::SupersedeChain(_)),
+        "a cycle must error rather than spin: {err}"
     );
 }
 
 #[tokio::test]
-async fn a_revoked_identity_is_dead_on_every_server() {
+async fn a_stranger_cannot_forward_someone_elses_key() {
+    let server = start_server(vec![]).await;
+    let client = client_for(&[&server]);
+    let identity = key::generate();
+    let attacker = key::generate();
+    let service = key::generate();
+    let delegation = issue(&identity, &service);
+
+    publisher_for(&service, &delegation, endpoints())
+        .publish(&client)
+        .await
+        .unwrap();
+
+    // The attacker mints their own delegation over the key and tries to point
+    // it at a key they hold.
+    let forged = Record::superseded(
+        key::public_of(&service),
+        Some(issue(&attacker, &service)),
+        99,
+        key::public_of(&key::generate()),
+        "mine now",
+    )
+    .sign(&attacker)
+    .expect("nothing stops them signing it");
+
+    assert!(client.publish(&forged).await.is_err());
+    let location = client
+        .resolve_service(&key::public_of(&service))
+        .await
+        .expect("the real key still resolves");
+    assert!(!location.is_stale());
+    assert_eq!(location.endpoints.len(), endpoints().len());
+}
+
+#[tokio::test]
+async fn a_retirement_replicates_to_peers() {
     let follower = start_server(vec![]).await;
     let leader = start_server(vec![follower.addr.clone()]).await;
     let client = client_for(&[&leader]);
-
     let identity = key::generate();
-    let id_pub = key::public_of(&identity);
-    let successor = key::public_of(&key::generate());
+    let service = key::generate();
+    let delegation = issue(&identity, &service);
+    let key = key::public_of(&service);
+
+    publisher_for(&service, &delegation, endpoints())
+        .publish(&client)
+        .await
+        .unwrap();
     client
-        .publish(&signed(&identity, 1, endpoints()))
+        .publish(
+            &Record::revoked(key, Some(delegation.clone()), 99, "host compromised")
+                .sign(&identity)
+                .unwrap(),
+        )
         .await
-        .unwrap();
+        .expect("revoke");
 
-    let revocation = Record::revoked(id_pub, 2, Some(successor), "host compromised")
-        .sign(&identity)
-        .unwrap();
-    client.publish(&revocation).await.expect("revoke");
-
-    // lookup still shows the tombstone, so an operator can see what happened.
-    let held = client.lookup(&id_pub).await.unwrap().expect("tombstone");
-    assert!(held.record.is_revoked());
-
-    // Anything that would dial fails closed, and names the untrusted hint.
-    let err = client.resolve_service(&id_pub).await.unwrap_err();
-    match err {
-        sqns_core::Error::Revoked {
-            successor: hint,
-            reason,
-            ..
-        } => {
-            assert_eq!(hint, Some(successor.to_string()));
-            assert_eq!(reason, "host compromised");
-        }
-        other => panic!("expected Revoked, got {other}"),
-    }
-    assert!(client.resolve(&id_pub).await.is_err());
-
-    // Nothing can be published for the key again.
-    let err = client
-        .publish(&signed(&identity, u64::MAX, endpoints()))
-        .await
-        .unwrap_err();
-    assert!(err.to_string().contains("revoked"), "{err}");
-
-    // And the tombstone replicates, so the peer is closed too.
     let store = Arc::clone(&follower.store);
     assert!(
         eventually(Duration::from_secs(5), || store
-            .get(&id_pub)
+            .get(&key)
             .is_some_and(|r| r.record.is_revoked()))
         .await,
         "the revocation never reached the peer"
     );
-    let follower_client = client_for(&[&follower]);
     assert!(
-        follower_client
-            .publish(&signed(&identity, u64::MAX, endpoints()))
+        client_for(&[&follower])
+            .publish(&signed_under(&service, &delegation, u64::MAX))
             .await
             .is_err(),
         "the peer must refuse publishes for a revoked key"
     );
+}
+
+#[tokio::test]
+async fn a_standalone_key_can_rotate_itself() {
+    let server = start_server(vec![]).await;
+    let client = client_for(&[&server]);
+    let old = key::generate();
+    let new = key::generate();
+
+    client.publish(&signed(&old, 1, endpoints())).await.unwrap();
+    client
+        .publish(&signed(&new, 1, moved_endpoints(9)))
+        .await
+        .unwrap();
+    client
+        .publish(
+            &Record::superseded(
+                key::public_of(&old),
+                None,
+                2,
+                key::public_of(&new),
+                "rotated",
+            )
+            .sign(&old)
+            .expect("a key with no identity signs its own retirement"),
+        )
+        .await
+        .expect("supersede");
+
+    let location = client
+        .resolve_service(&key::public_of(&old))
+        .await
+        .expect("resolve");
+    assert_eq!(location.key, key::public_of(&new));
+    assert_eq!(location.identity, None);
 }

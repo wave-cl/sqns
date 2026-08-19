@@ -39,9 +39,35 @@ impl Server {
     async fn handle(self: &Arc<Self>, req: Request) -> Response {
         match req {
             Request::Lookup { key } => {
-                let record = self.store.get(&key).map(Box::new);
-                tracing::debug!(key = %key.short(), found = record.is_some(), "lookup");
-                Response::Answer { record }
+                let record = self.store.get(&key);
+                // A tombstone that forwards travels with the record it forwards
+                // to, so the caller resolves a rotated key in one exchange.
+                let successor = record
+                    .as_ref()
+                    .and_then(|rec| rec.record.successor())
+                    .and_then(|next| self.store.get(&next))
+                    .map(Box::new);
+                tracing::debug!(
+                    key = %key.short(),
+                    found = record.is_some(),
+                    forwarded = successor.is_some(),
+                    "lookup"
+                );
+                Response::Answer {
+                    record: record.map(Box::new),
+                    successor,
+                }
+            }
+
+            Request::LookupIdentity { identity } => {
+                let records = self
+                    .store
+                    .identity_records(&identity, MAX_SYNC_BATCH as usize);
+                tracing::debug!(identity = %identity.short(), keys = records.len(), "identity lookup");
+                Response::Records {
+                    records,
+                    complete: true,
+                }
             }
 
             Request::Publish { record } => self.handle_publish(*record).await,
@@ -72,8 +98,8 @@ impl Server {
                 tracing::info!(
                     key = %key.short(),
                     serial,
-                    delegation = record.record.delegation_serial(),
-                    revoked = record.record.is_revoked(),
+                    identity = record.record.identity().map(|i| i.short()),
+                    terminal = record.record.is_terminal(),
                     endpoints = record.record.endpoints().len(),
                     "record stored"
                 );
@@ -91,6 +117,7 @@ impl Server {
                 let code = match e {
                     Error::Signature(_) => ErrorCode::BadSignature,
                     Error::Revoked { .. } => ErrorCode::Revoked,
+                    Error::Superseded { .. } => ErrorCode::Superseded,
                     Error::Delegation(_) => ErrorCode::BadDelegation,
                     _ => ErrorCode::Malformed,
                 };

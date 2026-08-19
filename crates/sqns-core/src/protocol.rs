@@ -29,6 +29,7 @@ const REQ_LOOKUP: u8 = 0x01;
 const REQ_PUBLISH: u8 = 0x02;
 const REQ_STATUS: u8 = 0x03;
 const REQ_SYNC: u8 = 0x04;
+const REQ_LOOKUP_IDENTITY: u8 = 0x05;
 
 // Response frame types.
 const RESP_ANSWER: u8 = 0x81;
@@ -52,6 +53,8 @@ pub enum ErrorCode {
     NotAuthorized = 7,
     /// The key is revoked; nothing will ever be accepted for it again.
     Revoked = 8,
+    /// The key has been retired in favour of a successor.
+    Superseded = 10,
     /// The record's delegation is missing, expired, or has been retired by a
     /// newer one.
     BadDelegation = 9,
@@ -67,6 +70,7 @@ impl ErrorCode {
             5 => Self::RateLimited,
             7 => Self::NotAuthorized,
             8 => Self::Revoked,
+            10 => Self::Superseded,
             9 => Self::BadDelegation,
             _ => Self::Internal,
         }
@@ -76,8 +80,10 @@ impl ErrorCode {
 /// A request from a client or a replication peer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
-    /// Resolve one public key to its endpoint set.
+    /// Resolve one service key to its endpoint set.
     Lookup { key: PubKey },
+    /// Every service key an identity has issued, as far as this server knows.
+    LookupIdentity { identity: PubKey },
     /// Publish or refresh a record. Only the record's own key can sign it.
     Publish { record: Box<SignedRecord> },
     /// Server counters, for health checks.
@@ -90,6 +96,7 @@ impl Request {
     fn frame_type(&self) -> u8 {
         match self {
             Self::Lookup { .. } => REQ_LOOKUP,
+            Self::LookupIdentity { .. } => REQ_LOOKUP_IDENTITY,
             Self::Publish { .. } => REQ_PUBLISH,
             Self::Status => REQ_STATUS,
             Self::Sync { .. } => REQ_SYNC,
@@ -99,7 +106,9 @@ impl Request {
     pub fn encode_payload(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         match self {
-            Self::Lookup { key } => buf.extend_from_slice(key.as_bytes()),
+            Self::Lookup { key } | Self::LookupIdentity { identity: key } => {
+                buf.extend_from_slice(key.as_bytes())
+            }
             Self::Publish { record } => record.encode_into(&mut buf),
             Self::Status => {}
             Self::Sync { since, limit } => {
@@ -115,6 +124,9 @@ impl Request {
         let req = match frame_type {
             REQ_LOOKUP => Self::Lookup {
                 key: PubKey::new(r.array::<32>("lookup key")?),
+            },
+            REQ_LOOKUP_IDENTITY => Self::LookupIdentity {
+                identity: PubKey::new(r.array::<32>("identity key")?),
             },
             REQ_PUBLISH => Self::Publish {
                 record: Box::new(SignedRecord::decode_from(&mut r)?),
@@ -157,7 +169,15 @@ pub struct StatusInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Response {
     /// The record for the requested key, or `None` if the server holds none.
-    Answer { record: Option<Box<SignedRecord>> },
+    ///
+    /// When that record retires the key in favour of a successor, `successor`
+    /// carries the successor's own current record — one hop, so the caller can
+    /// verify it against the key the tombstone actually named. Longer chains
+    /// are walked by the client.
+    Answer {
+        record: Option<Box<SignedRecord>>,
+        successor: Option<Box<SignedRecord>>,
+    },
     /// The record was accepted; `expires_at` is when the server will drop it.
     Published { serial: u64, expires_at: u64 },
     Status(StatusInfo),
@@ -191,13 +211,17 @@ impl Response {
     pub fn encode_payload(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         match self {
-            Self::Answer { record } => match record {
-                Some(rec) => {
-                    buf.push(1);
-                    rec.encode_into(&mut buf);
+            Self::Answer { record, successor } => {
+                for slot in [record, successor] {
+                    match slot {
+                        Some(rec) => {
+                            buf.push(1);
+                            rec.encode_into(&mut buf);
+                        }
+                        None => buf.push(0),
+                    }
                 }
-                None => buf.push(0),
-            },
+            }
             Self::Published { serial, expires_at } => {
                 buf.extend_from_slice(&serial.to_be_bytes());
                 buf.extend_from_slice(&expires_at.to_be_bytes());
@@ -227,17 +251,20 @@ impl Response {
         let mut r = Reader::new(payload);
         let resp = match frame_type {
             RESP_ANSWER => {
-                let present = r.u8("answer presence")?;
-                let record = match present {
-                    0 => None,
-                    1 => Some(Box::new(SignedRecord::decode_from(&mut r)?)),
-                    other => {
-                        return Err(Error::Protocol(format!(
-                            "invalid answer presence byte {other:#x}"
-                        )));
-                    }
-                };
-                Self::Answer { record }
+                let mut slots = [None, None];
+                for slot in &mut slots {
+                    *slot = match r.u8("answer presence")? {
+                        0 => None,
+                        1 => Some(Box::new(SignedRecord::decode_from(&mut r)?)),
+                        other => {
+                            return Err(Error::Protocol(format!(
+                                "invalid answer presence byte {other:#x}"
+                            )));
+                        }
+                    };
+                }
+                let [record, successor] = slots;
+                Self::Answer { record, successor }
             }
             RESP_PUBLISHED => Self::Published {
                 serial: r.u64("published serial")?,

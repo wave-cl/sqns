@@ -1317,7 +1317,7 @@ dependencies = [
 
 [[package]]
 name = "sqns"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "ed25519-dalek",
@@ -1332,7 +1332,7 @@ dependencies = [
 
 [[package]]
 name = "sqns-client"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ed25519-dalek",
  "quinn",
@@ -1345,7 +1345,7 @@ dependencies = [
 
 [[package]]
 name = "sqns-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bs58",
  "ed25519-dalek",
@@ -1357,7 +1357,7 @@ dependencies = [
 
 [[package]]
 name = "sqnsd"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "ed25519-dalek",

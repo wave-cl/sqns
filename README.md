@@ -14,10 +14,10 @@ backup.example.com:4433
 ```
 
 Keys stay fixed while addresses move. A node publishes where it can be reached,
-signed under the authority of the key it is publishing for, and refreshes that
-record on a timer; anything holding the key can look it up. The key survives a
-compromised host: it is an identity, not a transport key, and what clients dial
-can be rotated underneath it.
+signed by the key it is publishing for, and refreshes that record on a timer;
+anything holding the key can look it up. When a key does have to change — a
+breach, a rebuild — lookups of the old one **forward to the new one**, so the
+callers still holding it are carried across rather than stranded.
 
 ## Why not DNS
 
@@ -33,34 +33,34 @@ server that answered.
 | Answer | records signed by the zone, if DNSSEC | always signed under the key's own authority |
 | Trust | resolver chain and CAs | the key you already had |
 | Transport | UDP/53, DoT, DoH, DoQ | sQUIC only |
+| Key compromise | reissue from the CA or zone | retire the key; lookups forward to its replacement |
 | Server visibility | responds to anyone | silent to anyone without its public key |
-| Key compromise | reissue from the CA or zone | rotate the service key under a stable identity |
 
-(sqns does have *delegation*, but it means something else here: an identity key
-granting authority to a service key, never one server referring you to
-another.)
+## Service keys and identities
 
-## Identity keys and service keys
+The key you look up is the **service key**: the one in `sqc://host:port/<key>`,
+the one sQUIC pins, the one the node holds and signs its own records with. That
+is all a small deployment needs.
 
-The key you look up is an **identity key**, and it is meant to live offline. It
-signs a **delegation** naming the **service key** that the running node holds —
-and the service key is what clients pin for the sQUIC handshake and what signs
-the records themselves.
+A service key may also carry a **delegation** from an **identity key** kept
+offline. The identity does exactly one job, and it is the job the service key
+must not be able to do for itself — retire it:
 
 ```
 identity key  (offline, in a safe)
-      │  signs a delegation, valid for months
-      ▼
-service key   (on the host, refreshes records every few minutes)
-      ▼
-endpoints
+      │  issues a delegation over each service key
+      ├──────────────┬──────────────┐
+      ▼              ▼              ▼
+ service key A  service key B  service key C     ← each looked up on its own
+      ▼              ▼              ▼
+  endpoints      endpoints      endpoints
 ```
 
-That split is what makes compromise survivable: stealing the service key does
-not let an attacker publish, because publishing needs a delegation only the
-identity key can issue. A record with no delegation is signed by its own key and
-dialed directly — the simple single-key arrangement, still supported and still
-the default for `sqns publish` without `--delegation`.
+One identity issues as many service keys as it likes. Each resolves
+independently under its own public key, and each is rotated or revoked without
+touching the others — so three nodes of the same service are three service keys
+with three private keys on three hosts, which is the point: no key is ever
+copied between machines.
 
 ## Trust model
 
@@ -76,8 +76,9 @@ property does most of the work:
   over a newer one, and a node that disappears stops being advertised on its
   own. Clients also remember the highest authority they have seen for a key and
   refuse anything below it.
-- The client verifies every answer against the key it asked for, before the
-  answer is used or cached.
+- Retiring a key takes its identity, which is not on the machine that holds the
+  key. A thief who steals a service key can publish endpoints for it until it is
+  retired — but can never retire it, and never forward anyone anywhere.
 
 Servers inherit sQUIC's own posture: silent to anyone who does not hold the
 server's public key, and optionally restricted to a whitelist of client keys.
@@ -86,60 +87,70 @@ server's public key, and optionally restricted to a whitelist of client keys.
 
 | What was stolen | What happens |
 |---|---|
-| **Service key** | The operator issues a delegation with a higher serial from the offline identity key. Every record signed under the old delegation is refused from that moment — even one with the serial pushed to its maximum. Callers keep resolving the same identity; only the key they dial changes. |
-| **Identity key** | Not recoverable by cryptography: the thief can sign whatever the owner can. Revoke the identity, which fails closed, and re-provision a new one out of band. |
+| **A service key** | Its identity supersedes it, naming a replacement. Everything signed by the old key is refused from that moment, and lookups of it forward to the new key. Other service keys under the same identity are untouched. |
+| **An identity key** | Not recoverable by cryptography: the thief can sign whatever the owner can. Revoke the keys it issued, which fails closed, and re-provision out of band. |
 | **An sqns server** | Unchanged. It can withhold an answer, never forge one. |
 
 ### Rotating a compromised service key
 
 ```bash
 # On the machine holding the identity key — no network involved
-sqns delegate --identity-key identity.key --service-key service2.key \
-  --serial 2 --out d2.bin
+sqns delegate --identity-key identity.key --service-key service2.key --out d2.bin
 
-# On the node, with the new service key and the new delegation
+# On the replacement node
 sqns publish --key-file service2.key --delegation d2.bin -e '203.0.113.9:5300'
+
+# Retire the old key, pointing at the new one
+sqns supersede --old-key <old> --new-key <new> --identity-key identity.key
+```
+
+A client still holding the old key resolves straight through, and is told its
+pinned copy is stale:
+
+```
+$ sqns resolve <old>
+sqns: <old> has been rotated; it now resolves to <new>
+203.0.113.9:5300
 ```
 
 The thief's next publish is refused:
 
 ```
-server error BadDelegation: <identity> has delegation 2;
-this record was signed under 1
+server error Superseded: key <old> was superseded by <new>
 ```
 
-The retired delegation stays retired: servers remember the highest delegation
-serial for a key even after the records under it expire, and that mark is
-written to the snapshot. A peer learns of a rotation from the records it
-replicates, so rotate while the node is publishing normally.
+Retirement is permanent: the tombstone never expires, is never swept, survives a
+restart, and replicates like any other record.
 
-### Revoking an identity
+### Revoking a key outright
 
-Revocation is **permanent and irreversible**. Once a server holds the
-tombstone, no record for that key is ever accepted again, at any serial; the
-tombstone never expires and is never swept.
+When there is no replacement, revoke instead. Lookups then fail closed rather
+than forwarding.
 
 ```bash
-sqns revoke --key-file identity.key --reason "host compromised" \
-  --successor <new identity>
+sqns revoke --key <service key> --identity-key identity.key
+sqns revoke --all --identity-key identity.key    # every key this identity issued
 ```
 
-A revocation may name a successor, but it is only a hint: whoever stole the key
-could have written it. Clients surface it and never follow it — confirm any
-successor out of band before trusting it.
+### What a client cannot check
+
+A client that has *only ever* held a service key cannot verify which identity
+issued it — a thief with the stolen private key could mint a delegation naming
+an identity of their own. The server closes this by pinning the identity from
+the key's **first** record and refusing any later record that claims a different
+one, which covers every key registered before its theft; a client that has
+resolved the key before is protected by its own record of it. Resolution never
+depends on the identity index.
 
 ## Records
 
 | Field | Meaning |
 |---|---|
-| `key` | the identity key this record speaks for |
-| `serial` | version counter; the highest serial wins within a delegation |
+| `key` | the service key this record speaks for — the lookup index |
+| `delegation` | the identity that issued this key, if it has one |
+| `serial` | version counter; the highest serial wins |
 | `issued_at` / `ttl` | publication time and lifetime, in seconds |
-| body | either **live** — an optional delegation plus endpoints — or **revoked** |
-
-A live record's delegation carries the service key, its own monotonic serial,
-and an expiry. Ordering is by `(delegation serial, record serial, issued_at)`,
-so a new delegation outranks everything published under an older one.
+| body | **live**, **superseded**, or **revoked** |
 
 Each endpoint is a host, a port, a priority and a weight:
 
@@ -150,14 +161,14 @@ Each endpoint is a host, a port, a priority and a weight:
 | priority | tried in ascending order; lower wins |
 | weight | breaks ties within a priority, by weighted random draw |
 
-A live record with **no endpoints is a withdrawal** — the key is deliberately
-unreachable for now. Three states a caller can tell apart:
+Four states a caller can tell apart:
 
 | State | Meaning |
 |---|---|
 | no record | the key was never published here |
-| withdrawal | published, deliberately unreachable, may come back |
-| revocation | the identity is permanently dead and will never return |
+| withdrawal | a live record with no endpoints: deliberately unreachable, may come back |
+| superseded | retired, and forwarding to the key that replaced it |
+| revoked | permanently dead, with no replacement |
 
 ## Install
 
@@ -200,14 +211,26 @@ sqns lookup 2mTFsr7ozzywfcCzRENivZcWiFPpbbuejGXe61oRX1eu
 sqns resolve 2mTFsr7ozzywfcCzRENivZcWiFPpbbuejGXe61oRX1eu   # endpoints only
 ```
 
-That publishes under a single key, which is the simplest thing that works. For
-anything you would mind losing, put the identity key offline and delegate to a
-service key instead — see [Key compromise](#key-compromise):
+That standalone key can rotate itself, but nothing else can retire it if it is
+stolen. For anything you would mind losing, keep an identity key offline and
+issue service keys from it — see [Key compromise](#key-compromise).
+
+### Three nodes, one identity
 
 ```bash
-sqns delegate --identity-key identity.key --service-key service.key \
-  --serial 1 --out d1.bin                       # where the identity key lives
-sqns publish --key-file service.key --delegation d1.bin -e '198.51.100.4:443'
+# Offline, once per node
+for n in 1 2 3; do
+  sqns delegate --identity-key identity.key --service-key ns$n.key --out d$n.bin
+done
+
+# On each node, with only its own key and delegation
+sqns publish --key-file ns1.key --delegation d1.bin -e '198.51.100.1:443'
+```
+
+Each node resolves under its own public key, and the identity can list them:
+
+```bash
+sqns identity <identity>
 ```
 
 A long-running node should hold its record open, which republishes inside the
@@ -221,12 +244,14 @@ sqns publish --key-file node.key -e '198.51.100.4:443' --ttl 300 --keepalive
 
 | Command | Purpose |
 |---|---|
-| `sqns lookup <key>` | full record: serial, expiry, key to dial, endpoints — or the tombstone |
-| `sqns resolve <key>` | endpoints only, in the order to try them |
+| `sqns lookup <key>` | full record, or the tombstone and where it forwards to |
+| `sqns resolve <key>` | endpoints only, following rotations |
 | `sqns publish` | sign and publish an endpoint set |
 | `sqns withdraw` | publish an empty record |
-| `sqns delegate` | issue a delegation from an offline identity key (raise `--serial` to rotate) |
-| `sqns revoke` | permanently kill an identity |
+| `sqns delegate` | issue a delegation from an offline identity key |
+| `sqns supersede` | retire a key, forwarding to its replacement |
+| `sqns revoke` | permanently kill a service key, or all of an identity's |
+| `sqns identity <key>` | list the service keys an identity has issued |
 | `sqns status` | server counters |
 | `sqns keygen` | new keypair |
 | `sqnsd` | run a server |
@@ -246,8 +271,8 @@ Servers replicate by exchanging whole signed records, two ways at once:
   down and seeds a new one.
 
 Both paths land in the same verify-and-merge step, so ordering does not matter
-and a record can arrive twice without harm. Revocations travel the same way and
-are terminal wherever they land, so killing an identity on one server kills it
+and a record can arrive twice without harm. Retirements travel the same way and
+are terminal wherever they land, so retiring a key on one server retires it
 across the mesh. Peering is not automatically mutual: list each server on the
 other side too.
 
@@ -266,31 +291,34 @@ See [etc/sqnsd.toml](etc/sqnsd.toml) for every option.
 ```rust
 use sqns_client::{Publisher, Resolver};
 
-// Resolve: endpoints, plus the key to pin when dialing them
+// Resolve, following any rotation of the key you hold
 let resolver = Resolver::single("sqc://ns1.example.com:5300/EFj2…".parse()?)?;
 let service = resolver.resolve_service(&"2mTF…".parse()?).await?;
-// service.identity     — stable across rotations
-// service.service_key  — what to pin for the sQUIC handshake
-// service.endpoints    — priority order, weighted within each band
+// service.key        — the key actually reached; pin this one
+// service.identity   — who issued it, if anyone
+// service.endpoints  — priority order, weighted within each band
+if service.is_stale() {
+    // the key in your config has been rotated; store service.key instead
+}
 
-// Publish under a delegation, and keep the record alive. The identity key is
-// never in this process.
-let publisher = Arc::new(Publisher::delegated(
-    identity, service_key, delegation, endpoints, 300,
-)?);
+// Publish under a service key its identity issued. The identity key is never
+// in this process.
+let publisher = Arc::new(Publisher::delegated(service_key, delegation, endpoints, 300)?);
 tokio::spawn(Arc::clone(&publisher).run(Arc::new(resolver)));
 ```
 
 `resolve_service` and `resolve` fail closed on a revoked key with
-`Error::Revoked`; `lookup` hands back the tombstone so a tool can show it.
+`Error::Revoked`, and follow up to `MAX_SUPERSEDE_HOPS` rotations, erroring on a
+cycle rather than spinning. `lookup` hands back the tombstone so a tool can show
+it.
 
 ## Crates
 
 | Crate | Contents |
 |---|---|
-| `sqns-core` | records, delegations, revocations, canonical encoding, wire protocol |
+| `sqns-core` | records, delegations, retirement, canonical encoding, wire protocol |
 | `sqns-client` | resolver, cache, publisher — the embeddable half |
-| `sqnsd` | server: store, replication, revocation state, persistence |
+| `sqnsd` | server: store, identity bindings, replication, persistence |
 | `sqns` | command line client |
 
 ## Wire protocol
@@ -302,14 +330,20 @@ carries no handshake of its own.
 
 | Request | Response |
 |---|---|
-| `Lookup { key }` | `Answer { record? }` |
+| `Lookup { key }` | `Answer { record?, successor? }` |
+| `LookupIdentity { identity }` | `Records { records, complete }` |
 | `Publish { record }` | `Published { serial, expires_at }` |
 | `Status` | `Status { records, peers, uptime, version }` |
 | `Sync { since, limit }` | `Records { records, complete }` |
 
-A refused `Publish` comes back as an error naming why: `Stale` for a serial
-that lost, `BadSignature` for a broken chain, `BadDelegation` for authority
-that has been retired or has expired, `Revoked` for a key that is dead.
+When the answer is a superseded record, `successor` carries the replacement's
+own record — one hop, so the caller verifies it against the key the tombstone
+named. Longer chains are walked by the client.
+
+A refused `Publish` comes back as an error naming why: `Stale` for a serial that
+lost, `BadSignature` for a broken chain, `BadDelegation` for a delegation that
+does not match the key's identity or has expired, `Superseded` or `Revoked` for
+a key that has been retired.
 
 Record encoding is canonical and byte-stable — it is the input to the
 signature, which covers the delegation along with everything else. See
@@ -322,10 +356,11 @@ cargo test --workspace
 ```
 
 The suite covers encoding and signature round trips, forgery and rollback
-rejection, delegation and revocation rules, store and snapshot behaviour, and
-end-to-end publish, lookup, withdrawal, failover and replication over real sQUIC
-connections on loopback — including a full compromise drill: publish under one
-delegation, rotate to a new service key, and assert the old one is locked out.
+rejection, who may retire a key and who may not, store and snapshot behaviour,
+and end-to-end publish, lookup, withdrawal, failover and replication over real
+sQUIC connections on loopback — including three services under one identity,
+rotation with forwarding, and a rotation cycle being refused rather than
+followed.
 
 ## License
 

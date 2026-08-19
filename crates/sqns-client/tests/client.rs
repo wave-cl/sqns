@@ -10,7 +10,7 @@ use sqns_core::record::{Endpoint, Host, Record, SignedRecord, now_unix};
 
 fn record_with(ttl: u32, age: u64, endpoints: Vec<Endpoint>) -> SignedRecord {
     let sk = key::generate();
-    let mut record = Record::live(key::public_of(&sk), 1, ttl, endpoints);
+    let mut record = Record::live(key::public_of(&sk), None, 1, ttl, endpoints);
     record.issued_at = now_unix() - age;
     record.sign(&sk).expect("sign")
 }
@@ -72,6 +72,7 @@ fn ordering_keeps_priority_bands_intact() {
     let sk = key::generate();
     let record = Record::live(
         key::public_of(&sk),
+        None,
         1,
         300,
         vec![ep(1, 20, 1), ep(2, 10, 1), ep(3, 10, 1), ep(4, 30, 1)],
@@ -91,6 +92,7 @@ fn weight_decides_the_order_within_a_band() {
     let sk = key::generate();
     let record = Record::live(
         key::public_of(&sk),
+        None,
         1,
         300,
         // Same priority: the heavy endpoint should usually come first.
@@ -116,6 +118,7 @@ fn every_endpoint_appears_exactly_once() {
     let sk = key::generate();
     let record = Record::live(
         key::public_of(&sk),
+        None,
         1,
         300,
         vec![ep(1, 10, 0), ep(2, 10, 5), ep(3, 10, 5), ep(4, 20, 0)],
