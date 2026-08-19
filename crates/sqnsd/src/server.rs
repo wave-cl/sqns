@@ -1,0 +1,317 @@
+//! The server: accept sQUIC connections, answer requests, keep the store fresh.
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use ed25519_dalek::SigningKey;
+use sqns_core::error::{Error, Result};
+use sqns_core::key::public_of;
+use sqns_core::protocol::{ALPN, ErrorCode, MAX_SYNC_BATCH, Request, Response, StatusInfo};
+use sqns_core::record::SignedRecord;
+
+use crate::config::Config;
+use crate::replication::Replicator;
+use crate::store::{PutOutcome, Store};
+
+/// How often expired records are swept.
+const PURGE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Everything a request handler needs.
+struct Server {
+    store: Arc<Store>,
+    replicator: Arc<Replicator>,
+    allow_sync: bool,
+    started: Instant,
+}
+
+impl Server {
+    fn status(&self) -> StatusInfo {
+        StatusInfo {
+            records: self.store.len() as u64,
+            peers: self.replicator.peer_count() as u32,
+            uptime_secs: self.started.elapsed().as_secs(),
+            version: sqns_core::VERSION.to_string(),
+        }
+    }
+
+    /// Handle one request. Errors are returned to the caller as `Response`s;
+    /// this never fails the connection on a bad request.
+    async fn handle(self: &Arc<Self>, req: Request) -> Response {
+        match req {
+            Request::Lookup { key } => {
+                let record = self.store.get(&key).map(Box::new);
+                tracing::debug!(key = %key.short(), found = record.is_some(), "lookup");
+                Response::Answer { record }
+            }
+
+            Request::Publish { record } => self.handle_publish(*record).await,
+
+            Request::Status => Response::Status(self.status()),
+
+            Request::Sync { since, limit } => {
+                if !self.allow_sync {
+                    return Response::error(
+                        ErrorCode::NotAuthorized,
+                        "this server does not answer sync requests",
+                    );
+                }
+                let limit = limit.clamp(1, MAX_SYNC_BATCH) as usize;
+                let (records, complete) = self.store.since(since, limit);
+                tracing::debug!(since, returned = records.len(), complete, "sync");
+                Response::Records { records, complete }
+            }
+        }
+    }
+
+    async fn handle_publish(self: &Arc<Self>, record: SignedRecord) -> Response {
+        let key = record.key();
+        let (serial, expires_at) = (record.record.serial, record.record.expires_at());
+
+        match self.store.put(record.clone()) {
+            Ok(PutOutcome::Stored) => {
+                tracing::info!(
+                    key = %key.short(),
+                    serial,
+                    endpoints = record.record.endpoints.len(),
+                    "record stored"
+                );
+                // Fan out without making the publisher wait on peer round trips.
+                let replicator = Arc::clone(&self.replicator);
+                tokio::spawn(async move { replicator.push(record).await });
+                Response::Published { serial, expires_at }
+            }
+            Ok(PutOutcome::Stale) => Response::error(
+                ErrorCode::Stale,
+                format!("a record with serial >= {serial} is already held for {key}"),
+            ),
+            Err(e) => {
+                tracing::debug!(key = %key.short(), error = %e, "record rejected");
+                let code = match e {
+                    Error::Signature(_) => ErrorCode::BadSignature,
+                    _ => ErrorCode::Malformed,
+                };
+                Response::error(code, e.to_string())
+            }
+        }
+    }
+}
+
+/// A bound, ready-to-serve server.
+///
+/// Binding is separate from serving so a caller — a test, or a supervisor that
+/// wants the assigned port — can learn the local address before the accept loop
+/// starts.
+pub struct Bound {
+    listener: squic::ServerListener,
+    server: Arc<Server>,
+    store: Arc<Store>,
+    replicator: Arc<Replicator>,
+    persist_interval: Duration,
+    local_addr: std::net::SocketAddr,
+    public_key: sqns_core::key::PubKey,
+}
+
+impl Bound {
+    /// The address actually bound, which is what to use when the configured
+    /// port was 0.
+    pub fn local_addr(&self) -> std::net::SocketAddr {
+        self.local_addr
+    }
+
+    /// This server's public key — the one clients pin.
+    pub fn public_key(&self) -> sqns_core::key::PubKey {
+        self.public_key
+    }
+
+    /// `sqc://host:port/<key>`, ready to hand to a client.
+    pub fn connection_string(&self) -> String {
+        format!("sqc://{}/{}", self.local_addr, self.public_key)
+    }
+
+    pub fn store(&self) -> &Arc<Store> {
+        &self.store
+    }
+}
+
+/// Bind the listener and prepare the server without accepting yet.
+pub async fn bind(config: Config, signing_key: SigningKey) -> Result<Bound> {
+    let store = Arc::new(Store::open(config.state_file.clone())?);
+    let client_key_hex = sqns_client::hex_seed(&signing_key);
+    let replicator = Arc::new(Replicator::new(
+        &config.peers,
+        Arc::clone(&store),
+        client_key_hex,
+        config.sync_interval,
+    ));
+
+    let allowed_keys = if config.allowed_clients.is_empty() {
+        None
+    } else {
+        let mut keys = Vec::with_capacity(config.allowed_clients.len());
+        for k in &config.allowed_clients {
+            let x = squic::crypto::ed25519_public_to_x25519(k.as_bytes())
+                .map_err(|e| Error::Key(format!("client key {k} is unusable: {e}")))?;
+            keys.push(x.to_bytes());
+        }
+        Some(keys)
+    };
+
+    let squic_config = squic::Config {
+        alpn_protocols: vec![ALPN.to_vec()],
+        allowed_keys,
+        max_incoming_streams: 256,
+        max_idle_timeout: Duration::from_secs(60),
+        ..Default::default()
+    };
+
+    let listener = squic::listen(config.listen, &signing_key, squic_config)
+        .await
+        .map_err(|e| Error::Connection(format!("cannot listen on {}: {e}", config.listen)))?;
+
+    let server = Arc::new(Server {
+        store: Arc::clone(&store),
+        replicator: Arc::clone(&replicator),
+        allow_sync: config.allow_sync,
+        started: Instant::now(),
+    });
+
+    let local_addr = listener
+        .local_addr()
+        .map_err(|e| Error::Connection(format!("cannot read the local address: {e}")))?;
+
+    Ok(Bound {
+        listener,
+        server,
+        store,
+        replicator,
+        persist_interval: config.persist_interval,
+        local_addr,
+        public_key: public_of(&signing_key),
+    })
+}
+
+/// Serve until interrupted, then write a final snapshot.
+pub async fn serve(bound: Bound) -> Result<()> {
+    let Bound {
+        listener,
+        server,
+        store,
+        replicator,
+        persist_interval,
+        local_addr,
+        public_key,
+    } = bound;
+
+    tracing::info!(
+        listen = %local_addr,
+        key = %public_key,
+        records = store.len(),
+        peers = replicator.peer_count(),
+        "sqnsd {} listening", sqns_core::VERSION
+    );
+    tracing::info!("connection string: sqc://{local_addr}/{public_key}");
+
+    tokio::spawn(Arc::clone(&replicator).run());
+    tokio::spawn(maintenance(Arc::clone(&store), persist_interval));
+
+    let accept_loop = async {
+        while let Some(incoming) = listener.accept().await {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move {
+                let conn = match incoming.await {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "handshake failed");
+                        return;
+                    }
+                };
+                let peer = conn.remote_address();
+                tracing::debug!(%peer, "connection established");
+                serve_connection(server, conn).await;
+                tracing::debug!(%peer, "connection closed");
+            });
+        }
+    };
+
+    tokio::select! {
+        _ = accept_loop => tracing::warn!("listener stopped accepting"),
+        _ = tokio::signal::ctrl_c() => tracing::info!("shutting down"),
+    }
+
+    // Records outlive the process only if the snapshot is current.
+    listener.close(0u32.into(), b"shutdown");
+    if store.snapshot_path().is_some() {
+        match store.persist() {
+            Ok(()) => tracing::info!(records = store.len(), "snapshot written"),
+            Err(e) => tracing::error!(error = %e, "cannot write snapshot on shutdown"),
+        }
+    }
+    Ok(())
+}
+
+/// Answer every stream on one connection.
+async fn serve_connection(server: Arc<Server>, conn: quinn::Connection) {
+    loop {
+        let (mut send, mut recv) = match conn.accept_bi().await {
+            Ok(pair) => pair,
+            // The peer hung up, which is the normal end of a connection.
+            Err(_) => return,
+        };
+        let server = Arc::clone(&server);
+        tokio::spawn(async move {
+            let response = match Request::read_from(&mut recv).await {
+                Ok(req) => server.handle(req).await,
+                Err(e) => {
+                    tracing::debug!(error = %e, "malformed request");
+                    Response::error(ErrorCode::Malformed, e.to_string())
+                }
+            };
+            if let Err(e) = response.write_to(&mut send).await {
+                tracing::debug!(error = %e, "cannot send response");
+                return;
+            }
+            let _ = send.finish();
+        });
+    }
+}
+
+/// Bind and serve in one call.
+pub async fn run(config: Config, signing_key: SigningKey) -> Result<()> {
+    serve(bind(config, signing_key).await?).await
+}
+
+/// Sweep expired records and write the snapshot when something changed.
+async fn maintenance(store: Arc<Store>, persist_interval: Duration) {
+    let mut purge = tokio::time::interval(PURGE_INTERVAL);
+    let mut persist = tokio::time::interval(persist_interval);
+    purge.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    persist.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut persisted_revision = u64::MAX;
+
+    loop {
+        tokio::select! {
+            _ = purge.tick() => {
+                let removed = store.purge_expired();
+                if removed > 0 {
+                    tracing::info!(removed, "expired records swept");
+                }
+            }
+            _ = persist.tick() => {
+                if store.snapshot_path().is_none() {
+                    continue;
+                }
+                let revision = store.revision();
+                if revision == persisted_revision {
+                    continue;
+                }
+                match store.persist() {
+                    Ok(()) => {
+                        persisted_revision = revision;
+                        tracing::debug!(records = store.len(), "snapshot written");
+                    }
+                    Err(e) => tracing::error!(error = %e, "cannot write snapshot"),
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,18 @@
+[package]
+name = "sqns-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Embeddable sqns resolver and publisher"
+
+[dependencies]
+sqns-core = { workspace = true }
+squic = { workspace = true }
+quinn = { workspace = true }
+tokio = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }

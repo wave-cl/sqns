@@ -1,0 +1,40 @@
+# sqnsd configuration.
+#
+# Every field except key_file has a default; command line flags override
+# anything set here.
+
+# Address to listen on. UDP, since sQUIC rides QUIC.
+listen = "[::]:5300"
+
+# This server's identity: a file holding a hex Ed25519 seed, mode 0600.
+# Create one with: sqnsd keygen --out /etc/sqns/sqnsd.key
+key_file = "/etc/sqns/sqnsd.key"
+
+# Where records are snapshotted so they survive a restart.
+# Omit to keep records in memory only.
+state_file = "/var/lib/sqns/records.db"
+
+# Replication peers. Records are signed by the keys they describe, so peers
+# need no trust in each other: a peer can withhold a record but never forge or
+# alter one. Peering is not automatically mutual — list this server on the
+# other side too.
+peers = [
+  # "sqc://ns2.example.com:5300/EFj2YJzH6MwVfPnbLdR4SjrUkA9QpXhgK7CcTx31Wm5",
+]
+
+# Base58 client keys allowed to connect at all. Leave empty and anyone holding
+# this server's public key may connect; list keys and everyone else is dropped
+# silently, before the QUIC handshake.
+allowed_clients = []
+
+# Answer anti-entropy pulls, which hand the caller the whole record set.
+# Peers need this; a public-facing server that should only answer point
+# lookups can set it to false.
+allow_sync = true
+
+# How often to pull from each peer, in seconds.
+sync_interval_secs = 60
+
+# How often to write the snapshot, in seconds. Writes are skipped when nothing
+# changed, and a final snapshot is written on shutdown.
+persist_interval_secs = 30
