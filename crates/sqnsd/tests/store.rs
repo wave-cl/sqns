@@ -3,11 +3,13 @@
 use std::net::Ipv4Addr;
 
 use sqns_core::key;
-use sqns_core::record::{Endpoint, Host, Record, SignedRecord, now_unix};
+use sqns_core::record::{
+    Delegation, Endpoint, Host, Record, RecordBody, SignedRecord, now_unix,
+};
 use sqnsd::store::{PutOutcome, Store};
 
 fn record_for(sk: &ed25519_dalek::SigningKey, serial: u64, port: u16) -> SignedRecord {
-    Record::new(
+    Record::live(
         key::public_of(sk),
         serial,
         300,
@@ -41,7 +43,7 @@ fn a_newer_serial_replaces_an_older_one() {
     );
     let held = store.get(&key::public_of(&sk)).unwrap();
     assert_eq!(held.record.serial, 2);
-    assert_eq!(held.record.endpoints[0].port, 6000);
+    assert_eq!(held.record.endpoints()[0].port, 6000);
 }
 
 #[test]
@@ -59,7 +61,7 @@ fn a_forged_record_is_refused() {
     let store = Store::new(None);
     let sk = key::generate();
     let mut rec = record_for(&sk, 1, 5300);
-    rec.record.endpoints[0].port = 31337;
+    tamper_port(&mut rec, 31337);
 
     let err = store.put(rec).unwrap_err();
     assert!(matches!(err, sqns_core::Error::Signature(_)), "{err}");
@@ -70,7 +72,7 @@ fn a_forged_record_is_refused() {
 fn a_record_from_the_future_is_refused() {
     let store = Store::new(None);
     let sk = key::generate();
-    let mut record = Record::new(
+    let mut record = Record::live(
         key::public_of(&sk),
         1,
         300,
@@ -86,7 +88,7 @@ fn a_record_from_the_future_is_refused() {
 fn expired_records_are_neither_served_nor_kept() {
     let store = Store::new(None);
     let sk = key::generate();
-    let mut record = Record::new(
+    let mut record = Record::live(
         key::public_of(&sk),
         1,
         60,
@@ -155,7 +157,7 @@ fn a_snapshot_survives_a_restart() {
     assert_eq!(reopened.len(), 3);
     for (i, sk) in keys.iter().enumerate() {
         let held = reopened.get(&key::public_of(sk)).expect("record reloaded");
-        assert_eq!(held.record.endpoints[0].port, 5300 + i as u16);
+        assert_eq!(held.record.endpoints()[0].port, 5300 + i as u16);
         held.verify().expect("reloaded records are still signed");
     }
 }
@@ -195,4 +197,171 @@ fn the_revision_counter_tracks_changes() {
 
     store.put(record_for(&sk, 1, 5300)).ok();
     assert_eq!(store.revision(), after, "a stale put changes nothing");
+}
+
+/// Alter an endpoint after signing, the way an attacker on the wire would.
+fn tamper_port(signed: &mut SignedRecord, port: u16) {
+    match &mut signed.record.body {
+        RecordBody::Live { endpoints, .. } => endpoints[0].port = port,
+        RecordBody::Revoked { .. } => panic!("no endpoints to tamper with"),
+    }
+}
+
+// -- Revocation and delegation --
+
+fn delegated_record(
+    identity: &ed25519_dalek::SigningKey,
+    service: &ed25519_dalek::SigningKey,
+    delegation: &Delegation,
+    serial: u64,
+    port: u16,
+) -> SignedRecord {
+    Record::delegated(
+        key::public_of(identity),
+        serial,
+        300,
+        delegation.clone(),
+        vec![Endpoint::new(Host::V4(Ipv4Addr::LOCALHOST), port)],
+    )
+    .sign(service)
+    .expect("sign")
+}
+
+fn delegation_for(
+    identity: &ed25519_dalek::SigningKey,
+    service: &ed25519_dalek::SigningKey,
+    serial: u64,
+) -> Delegation {
+    Delegation::issue(
+        identity,
+        key::public_of(service),
+        serial,
+        now_unix() + 86_400,
+    )
+    .expect("issue")
+}
+
+#[test]
+fn a_revocation_shuts_the_key_for_good() {
+    let store = Store::new(None);
+    let sk = key::generate();
+    store.put(record_for(&sk, 1, 5300)).unwrap();
+
+    let revocation = Record::revoked(key::public_of(&sk), 2, None, "stolen")
+        .sign(&sk)
+        .unwrap();
+    assert_eq!(store.put(revocation).unwrap(), PutOutcome::Stored);
+
+    // Nothing gets in afterwards, however high the serial.
+    let err = store.put(record_for(&sk, u64::MAX, 6000)).unwrap_err();
+    assert!(matches!(err, sqns_core::Error::Revoked { .. }), "{err}");
+
+    // Not even another revocation, and not the same one replayed.
+    let again = Record::revoked(key::public_of(&sk), u64::MAX, None, "again")
+        .sign(&sk)
+        .unwrap();
+    assert!(store.put(again).is_err());
+
+    assert!(store.get(&key::public_of(&sk)).unwrap().record.is_revoked());
+}
+
+#[test]
+fn a_revocation_is_never_swept() {
+    let store = Store::new(None);
+    let sk = key::generate();
+    let mut record = Record::revoked(key::public_of(&sk), 1, None, "stolen");
+    record.issued_at = now_unix() - 3600;
+    record.ttl = 60; // long lapsed, were it an ordinary record
+    store.put(record.sign(&sk).unwrap()).unwrap();
+
+    assert_eq!(store.purge_expired(), 0, "a tombstone must not be swept");
+    assert!(store.get(&key::public_of(&sk)).is_some());
+}
+
+#[test]
+fn a_revocation_survives_a_restart_and_still_blocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("records.db");
+    let sk = key::generate();
+
+    {
+        let store = Store::new(Some(path.clone()));
+        store
+            .put(
+                Record::revoked(key::public_of(&sk), 1, None, "stolen")
+                    .sign(&sk)
+                    .unwrap(),
+            )
+            .unwrap();
+        store.persist().unwrap();
+    }
+
+    let reopened = Store::open(Some(path)).unwrap();
+    assert!(reopened.get(&key::public_of(&sk)).unwrap().record.is_revoked());
+    assert!(reopened.put(record_for(&sk, u64::MAX, 5300)).is_err());
+}
+
+#[test]
+fn a_newer_delegation_retires_the_key_it_replaces() {
+    let store = Store::new(None);
+    let identity = key::generate();
+    let stolen = key::generate();
+    let fresh = key::generate();
+    let d1 = delegation_for(&identity, &stolen, 1);
+    let d2 = delegation_for(&identity, &fresh, 2);
+
+    store
+        .put(delegated_record(&identity, &stolen, &d1, 1, 5300))
+        .unwrap();
+
+    // The operator rotates: a low record serial under delegation 2 still wins.
+    assert_eq!(
+        store
+            .put(delegated_record(&identity, &fresh, &d2, 1, 6000))
+            .unwrap(),
+        PutOutcome::Stored
+    );
+    assert_eq!(
+        store
+            .get(&key::public_of(&identity))
+            .unwrap()
+            .service_key(),
+        key::public_of(&fresh)
+    );
+
+    // The thief still holds the old service key and pushes the serial up.
+    let err = store
+        .put(delegated_record(&identity, &stolen, &d1, u64::MAX, 31337))
+        .unwrap_err();
+    assert!(matches!(err, sqns_core::Error::Delegation(_)), "{err}");
+
+    // And cannot fall back to publishing without a delegation at all.
+    assert!(store.put(record_for(&identity, u64::MAX, 31337)).is_err());
+}
+
+#[test]
+fn a_retired_delegation_stays_retired_across_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("records.db");
+    let identity = key::generate();
+    let stolen = key::generate();
+    let fresh = key::generate();
+    let d1 = delegation_for(&identity, &stolen, 1);
+    let d2 = delegation_for(&identity, &fresh, 2);
+
+    {
+        let store = Store::new(Some(path.clone()));
+        store
+            .put(delegated_record(&identity, &fresh, &d2, 1, 6000))
+            .unwrap();
+        store.persist().unwrap();
+    }
+
+    // The mark travels in the snapshot, so the old service key is refused even
+    // by a server that has only just started.
+    let reopened = Store::open(Some(path)).unwrap();
+    let err = reopened
+        .put(delegated_record(&identity, &stolen, &d1, u64::MAX, 31337))
+        .unwrap_err();
+    assert!(matches!(err, sqns_core::Error::Delegation(_)), "{err}");
 }

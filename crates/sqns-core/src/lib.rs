@@ -6,7 +6,7 @@
 //! describes, so callers verify answers end-to-end rather than trusting the
 //! server that handed them over.
 //!
-//! - [`record`] — records, endpoints, canonical encoding, signing and verification
+//! - [`record`] — records, delegations, revocations, signing and verification
 //! - [`protocol`] — the request/response wire format spoken over sQUIC
 //! - [`key`] — base58 public keys and on-disk private seeds
 //! - [`addr`] — `sqc://host:port/<base58 key>` server addresses
@@ -22,7 +22,7 @@ pub use addr::ServerAddr;
 pub use error::{Error, Result};
 pub use key::PubKey;
 pub use protocol::{ALPN, DEFAULT_PORT, Request, Response};
-pub use record::{Endpoint, Host, Record, SignedRecord, now_unix};
+pub use record::{Delegation, DelegationFile, Endpoint, Host, Record, RecordBody, SignedRecord, now_unix};
 
 /// Crate version, reported by `Status`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

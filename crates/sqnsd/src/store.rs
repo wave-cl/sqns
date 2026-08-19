@@ -2,9 +2,18 @@
 //!
 //! The store is the only place records enter the server, and every path in —
 //! a client publishing, a peer replicating, a snapshot loading from disk —
-//! goes through [`Store::put`], which verifies the signature before the record
-//! is kept. A record is accepted only if it beats the one already held, which
-//! makes replication order-independent and replay-safe.
+//! goes through [`Store::put`], which verifies the signature chain before the
+//! record is kept. A record is accepted only if it beats the one already held,
+//! which makes replication order-independent and replay-safe.
+//!
+//! Two pieces of state outlive the records themselves, because both exist to
+//! stop a stolen key from coming back:
+//!
+//! - **Revocations are terminal.** Once a key is revoked, no later record for
+//!   it is ever accepted, and the tombstone never expires or gets swept.
+//! - **Delegation marks.** The highest delegation serial seen for a key is
+//!   remembered even after its records expire, so a service key retired by a
+//!   newer delegation cannot publish again once the old record lapses.
 
 use std::collections::HashMap;
 use std::fs;
@@ -20,7 +29,7 @@ use sqns_core::record::{MAX_CLOCK_SKEW, SignedRecord, now_unix};
 
 /// Snapshot file magic and format version.
 const SNAPSHOT_MAGIC: &[u8; 6] = b"SQNSDB";
-const SNAPSHOT_VERSION: u8 = 1;
+const SNAPSHOT_VERSION: u8 = 2;
 
 /// What [`Store::put`] did with a record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +49,9 @@ impl PutOutcome {
 /// In-memory record set with an optional on-disk snapshot.
 pub struct Store {
     records: RwLock<HashMap<PubKey, SignedRecord>>,
+    /// Highest delegation serial ever accepted for a key. Outlives the record
+    /// it came from, so expiry cannot reopen a retired service key.
+    delegation_marks: RwLock<HashMap<PubKey, u64>>,
     path: Option<PathBuf>,
     /// Bumped on every change, so the snapshot writer can skip idle intervals.
     revision: AtomicU64,
@@ -49,6 +61,7 @@ impl Store {
     pub fn new(path: Option<PathBuf>) -> Self {
         Self {
             records: RwLock::new(HashMap::new()),
+            delegation_marks: RwLock::new(HashMap::new()),
             path,
             revision: AtomicU64::new(0),
         }
@@ -67,7 +80,18 @@ impl Store {
             return Ok(store);
         }
         let bytes = fs::read(&path)?;
-        let records = decode_snapshot(&bytes)?;
+        // A snapshot we cannot read is not a reason to refuse to start: an
+        // empty server recovers its records from peers, a dead one recovers
+        // nothing.
+        let (records, marks) = match decode_snapshot(&bytes) {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e,
+                    "ignoring unreadable snapshot; starting with no records");
+                return Ok(store);
+            }
+        };
+        store.delegation_marks.write().unwrap().extend(marks);
         let now = now_unix();
         let (mut loaded, mut dropped) = (0usize, 0usize);
         for rec in records {
@@ -102,12 +126,49 @@ impl Store {
         if record.record.is_expired(now) {
             return Err(Error::Expired(now - record.record.expires_at()));
         }
+        // Authority that has run out is no authority: a service key whose
+        // delegation lapsed cannot publish, even though its signature is good.
+        if let Some(d) = record.record.delegation()
+            && d.is_expired(now)
+        {
+            return Err(Error::Delegation(format!(
+                "delegation to {} expired {}s ago",
+                d.service_key,
+                now - d.not_after
+            )));
+        }
+
+        let key = record.key();
+        let delegation_serial = record.record.delegation_serial();
 
         let mut records = self.records.write().unwrap();
-        match records.get(&record.key()) {
+        let mut marks = self.delegation_marks.write().unwrap();
+
+        // A revoked key is dead for good, whatever the record claims.
+        if let Some(held) = records.get(&key)
+            && let Some(revoked) = held.revocation_error()
+        {
+            return Err(revoked);
+        }
+        // A service key retired by a newer delegation stays retired, even once
+        // the record that retired it has expired and been swept.
+        if let Some(mark) = marks.get(&key)
+            && delegation_serial < *mark
+            && !record.record.is_revoked()
+        {
+            return Err(Error::Delegation(format!(
+                "{key} has delegation {mark}; this record was signed under {delegation_serial}"
+            )));
+        }
+
+        match records.get(&key) {
             Some(held) if !record.record.supersedes(&held.record) => Ok(PutOutcome::Stale),
             _ => {
-                records.insert(record.key(), record);
+                marks
+                    .entry(key)
+                    .and_modify(|m| *m = (*m).max(delegation_serial))
+                    .or_insert(delegation_serial);
+                records.insert(key, record);
                 self.revision.fetch_add(1, Ordering::Relaxed);
                 Ok(PutOutcome::Stored)
             }
@@ -187,7 +248,8 @@ impl Store {
         }
         let bytes = {
             let records = self.records.read().unwrap();
-            encode_snapshot(records.values())
+            let marks = self.delegation_marks.read().unwrap();
+            encode_snapshot(records.values(), &marks)
         };
 
         let tmp = path.with_extension("tmp");
@@ -200,18 +262,32 @@ impl Store {
     }
 }
 
-fn encode_snapshot<'a>(records: impl ExactSizeIterator<Item = &'a SignedRecord>) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(16 + records.len() * 128);
+fn encode_snapshot<'a>(
+    records: impl ExactSizeIterator<Item = &'a SignedRecord>,
+    marks: &HashMap<PubKey, u64>,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(16 + records.len() * 128 + marks.len() * 40);
     buf.extend_from_slice(SNAPSHOT_MAGIC);
     buf.push(SNAPSHOT_VERSION);
     buf.extend_from_slice(&(records.len() as u32).to_be_bytes());
     for rec in records {
         buf.extend_from_slice(&rec.encode());
     }
+    // Marks are written after the records, and deliberately kept even for keys
+    // whose records have lapsed.
+    buf.extend_from_slice(&(marks.len() as u32).to_be_bytes());
+    let mut sorted: Vec<_> = marks.iter().collect();
+    sorted.sort_by_key(|(key, _)| **key);
+    for (key, serial) in sorted {
+        buf.extend_from_slice(key.as_bytes());
+        buf.extend_from_slice(&serial.to_be_bytes());
+    }
     buf
 }
 
-fn decode_snapshot(bytes: &[u8]) -> Result<Vec<SignedRecord>> {
+type Snapshot = (Vec<SignedRecord>, HashMap<PubKey, u64>);
+
+fn decode_snapshot(bytes: &[u8]) -> Result<Snapshot> {
     let mut r = Reader::new(bytes);
     let magic = r.bytes(SNAPSHOT_MAGIC.len(), "snapshot magic")?;
     if magic != SNAPSHOT_MAGIC {
@@ -224,10 +300,16 @@ fn decode_snapshot(bytes: &[u8]) -> Result<Vec<SignedRecord>> {
         )));
     }
     let count = r.u32("snapshot record count")? as usize;
-    let mut out = Vec::with_capacity(count.min(4096));
+    let mut records = Vec::with_capacity(count.min(4096));
     for _ in 0..count {
-        out.push(SignedRecord::decode_from(&mut r)?);
+        records.push(SignedRecord::decode_from(&mut r)?);
+    }
+    let mark_count = r.u32("snapshot mark count")? as usize;
+    let mut marks = HashMap::with_capacity(mark_count.min(4096));
+    for _ in 0..mark_count {
+        let key = PubKey::new(r.array::<32>("mark key")?);
+        marks.insert(key, r.u64("mark delegation serial")?);
     }
     r.finish("snapshot")?;
-    Ok(out)
+    Ok((records, marks))
 }

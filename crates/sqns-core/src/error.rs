@@ -29,6 +29,21 @@ pub enum Error {
     #[error("invalid sqc:// address: {0}")]
     Address(String),
 
+    #[error("key {key} is revoked: {reason}")]
+    Revoked {
+        key: String,
+        /// Untrusted hint at the operator's new identity, if the revocation
+        /// named one. Never act on it without out-of-band confirmation.
+        successor: Option<String>,
+        reason: String,
+    },
+
+    #[error("refusing a downgrade for {0}: a newer authority for this key was already seen")]
+    Downgrade(String),
+
+    #[error("delegation error: {0}")]
+    Delegation(String),
+
     #[error("no record published for {0}")]
     Unpublished(String),
 

@@ -17,7 +17,7 @@ pub fn order_endpoints(record: &Record) -> Vec<Endpoint> {
 /// Same as [`order_endpoints`], with a caller-supplied RNG (used by tests).
 pub fn order_with<R: Rng>(record: &Record, rng: &mut R) -> Vec<Endpoint> {
     let mut bands: Vec<(u16, Vec<Endpoint>)> = Vec::new();
-    let mut sorted = record.endpoints.clone();
+    let mut sorted = record.endpoints().to_vec();
     sorted.sort_by_key(|e| e.priority);
     for ep in sorted {
         match bands.last_mut() {
@@ -26,7 +26,7 @@ pub fn order_with<R: Rng>(record: &Record, rng: &mut R) -> Vec<Endpoint> {
         }
     }
 
-    let mut out = Vec::with_capacity(record.endpoints.len());
+    let mut out = Vec::with_capacity(record.endpoints().len());
     for (_, mut band) in bands {
         while !band.is_empty() {
             let total: u64 = band.iter().map(|e| e.weight as u64).sum();

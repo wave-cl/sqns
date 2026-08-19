@@ -72,7 +72,9 @@ impl Server {
                 tracing::info!(
                     key = %key.short(),
                     serial,
-                    endpoints = record.record.endpoints.len(),
+                    delegation = record.record.delegation_serial(),
+                    revoked = record.record.is_revoked(),
+                    endpoints = record.record.endpoints().len(),
                     "record stored"
                 );
                 // Fan out without making the publisher wait on peer round trips.
@@ -88,6 +90,8 @@ impl Server {
                 tracing::debug!(key = %key.short(), error = %e, "record rejected");
                 let code = match e {
                     Error::Signature(_) => ErrorCode::BadSignature,
+                    Error::Revoked { .. } => ErrorCode::Revoked,
+                    Error::Delegation(_) => ErrorCode::BadDelegation,
                     _ => ErrorCode::Malformed,
                 };
                 Response::error(code, e.to_string())

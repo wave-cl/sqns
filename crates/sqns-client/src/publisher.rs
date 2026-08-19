@@ -1,9 +1,13 @@
 //! Self-registration: sign your own endpoint set and keep it refreshed.
 //!
-//! A node holds the private key that its record speaks for, so it is the only
-//! party that can publish or change that record. Records expire, so a node that
-//! goes away stops being advertised without anyone having to retract it — the
-//! publisher re-signs on a timer well inside the TTL.
+//! A node publishes under its own authority — either its identity key directly,
+//! or, better, a service key that the identity key delegated to it. Records
+//! expire, so a node that goes away stops being advertised without anyone
+//! having to retract it: the publisher re-signs on a timer well inside the TTL.
+//!
+//! Under a delegation the identity key is never in this process. That is the
+//! point: a host compromise yields the service key, which is useless for
+//! publishing once the operator issues a delegation with a higher serial.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,16 +17,21 @@ use ed25519_dalek::SigningKey;
 use sqns_core::error::{Error, Result};
 use sqns_core::protocol::ErrorCode;
 use sqns_core::key::{PubKey, public_of};
-use sqns_core::record::{Endpoint, Record, SignedRecord, now_unix};
+use sqns_core::record::{Delegation, Endpoint, Record, SignedRecord, now_unix};
 
 use crate::resolver::Resolver;
 
 /// Default record lifetime, in seconds.
 pub const DEFAULT_TTL: u32 = 300;
 
-/// Publishes and refreshes the record for one key.
+/// Publishes and refreshes the record for one identity.
 pub struct Publisher {
+    /// The key that signs records: the delegated service key, or the identity
+    /// key itself when publishing without a delegation.
     signing_key: SigningKey,
+    /// The identity the records speak for — the key clients look up.
+    identity: PubKey,
+    delegation: Option<Delegation>,
     endpoints: Vec<Endpoint>,
     ttl: u32,
     serial: AtomicU64,
@@ -33,15 +42,57 @@ impl Publisher {
     /// after a restart still supersedes whatever the network already holds.
     pub fn new(signing_key: SigningKey, endpoints: Vec<Endpoint>, ttl: u32) -> Self {
         Self {
+            identity: public_of(&signing_key),
             signing_key,
+            delegation: None,
             endpoints,
             ttl,
             serial: AtomicU64::new(now_unix()),
         }
     }
 
+    /// Publish for `identity` using a service key it delegated to.
+    ///
+    /// Fails unless the delegation was really issued by `identity` and names
+    /// exactly this service key — catching a mismatched pair here rather than
+    /// on the server.
+    pub fn delegated(
+        identity: PubKey,
+        service_key: SigningKey,
+        delegation: Delegation,
+        endpoints: Vec<Endpoint>,
+        ttl: u32,
+    ) -> Result<Self> {
+        delegation.verify(&identity)?;
+        let service_pub = public_of(&service_key);
+        if delegation.service_key != service_pub {
+            return Err(Error::Delegation(format!(
+                "delegation names service key {} but this node holds {service_pub}",
+                delegation.service_key
+            )));
+        }
+        Ok(Self {
+            signing_key: service_key,
+            identity,
+            delegation: Some(delegation),
+            endpoints,
+            ttl,
+            serial: AtomicU64::new(now_unix()),
+        })
+    }
+
+    /// The identity these records speak for.
     pub fn key(&self) -> PubKey {
+        self.identity
+    }
+
+    /// The key clients pin when dialing.
+    pub fn service_key(&self) -> PubKey {
         public_of(&self.signing_key)
+    }
+
+    pub fn delegation(&self) -> Option<&Delegation> {
+        self.delegation.as_ref()
     }
 
     pub fn ttl(&self) -> u32 {
@@ -61,7 +112,10 @@ impl Publisher {
 
     fn sign(&self, endpoints: Vec<Endpoint>) -> Result<SignedRecord> {
         let serial = self.serial.fetch_add(1, Ordering::SeqCst);
-        let record = Record::new(self.key(), serial, self.ttl, endpoints);
+        let record = match &self.delegation {
+            Some(d) => Record::delegated(self.identity, serial, self.ttl, d.clone(), endpoints),
+            None => Record::live(self.identity, serial, self.ttl, endpoints),
+        };
         record.validate()?;
         record.sign(&self.signing_key)
     }

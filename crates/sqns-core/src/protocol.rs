@@ -50,6 +50,11 @@ pub enum ErrorCode {
     Internal = 6,
     /// Operation restricted to configured replication peers.
     NotAuthorized = 7,
+    /// The key is revoked; nothing will ever be accepted for it again.
+    Revoked = 8,
+    /// The record's delegation is missing, expired, or has been retired by a
+    /// newer one.
+    BadDelegation = 9,
 }
 
 impl ErrorCode {
@@ -61,6 +66,8 @@ impl ErrorCode {
             4 => Self::Stale,
             5 => Self::RateLimited,
             7 => Self::NotAuthorized,
+            8 => Self::Revoked,
+            9 => Self::BadDelegation,
             _ => Self::Internal,
         }
     }

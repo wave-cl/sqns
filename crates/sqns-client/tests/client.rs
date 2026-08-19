@@ -10,7 +10,7 @@ use sqns_core::record::{Endpoint, Host, Record, SignedRecord, now_unix};
 
 fn record_with(ttl: u32, age: u64, endpoints: Vec<Endpoint>) -> SignedRecord {
     let sk = key::generate();
-    let mut record = Record::new(key::public_of(&sk), 1, ttl, endpoints);
+    let mut record = Record::live(key::public_of(&sk), 1, ttl, endpoints);
     record.issued_at = now_unix() - age;
     record.sign(&sk).expect("sign")
 }
@@ -70,7 +70,7 @@ fn purge_clears_what_has_lapsed() {
 #[test]
 fn ordering_keeps_priority_bands_intact() {
     let sk = key::generate();
-    let record = Record::new(
+    let record = Record::live(
         key::public_of(&sk),
         1,
         300,
@@ -89,7 +89,7 @@ fn ordering_keeps_priority_bands_intact() {
 #[test]
 fn weight_decides_the_order_within_a_band() {
     let sk = key::generate();
-    let record = Record::new(
+    let record = Record::live(
         key::public_of(&sk),
         1,
         300,
@@ -114,7 +114,7 @@ fn weight_decides_the_order_within_a_band() {
 #[test]
 fn every_endpoint_appears_exactly_once() {
     let sk = key::generate();
-    let record = Record::new(
+    let record = Record::live(
         key::public_of(&sk),
         1,
         300,

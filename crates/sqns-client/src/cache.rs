@@ -16,7 +16,8 @@ pub const NEGATIVE_TTL: u64 = 30;
 
 #[derive(Debug, Clone)]
 enum Entry {
-    Found(SignedRecord),
+    // Boxed: a record dwarfs the negative entry beside it.
+    Found(Box<SignedRecord>),
     Missing { until: u64 },
 }
 
@@ -37,7 +38,7 @@ impl Cache {
         let now = now_unix();
         let mut entries = self.entries.lock().unwrap();
         match entries.get(key) {
-            Some(Entry::Found(rec)) if !rec.record.is_expired(now) => Some(Some(rec.clone())),
+            Some(Entry::Found(rec)) if !rec.record.is_expired(now) => Some(Some((**rec).clone())),
             Some(Entry::Missing { until }) if now < *until => Some(None),
             Some(_) => {
                 entries.remove(key);
@@ -51,7 +52,7 @@ impl Cache {
         self.entries
             .lock()
             .unwrap()
-            .insert(record.key(), Entry::Found(record));
+            .insert(record.key(), Entry::Found(Box::new(record)));
     }
 
     pub fn put_missing(&self, key: PubKey) {

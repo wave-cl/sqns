@@ -8,7 +8,7 @@ use ed25519_dalek::SigningKey;
 use sqns_client::{Resolver, ResolverConfig};
 use sqns_core::addr::ServerAddr;
 use sqns_core::key;
-use sqns_core::record::{Endpoint, Host, Record, SignedRecord};
+use sqns_core::record::{Delegation, Endpoint, Host, Record, RecordBody, SignedRecord};
 use sqnsd::config::Config;
 use sqnsd::server;
 
@@ -71,7 +71,7 @@ fn endpoints() -> Vec<Endpoint> {
 }
 
 fn signed(sk: &SigningKey, serial: u64, endpoints: Vec<Endpoint>) -> SignedRecord {
-    Record::new(key::public_of(sk), serial, 300, endpoints)
+    Record::live(key::public_of(sk), serial, 300, endpoints)
         .sign(sk)
         .expect("sign")
 }
@@ -106,7 +106,7 @@ async fn publish_then_look_up_a_key() {
         .expect("lookup")
         .expect("a record is held");
     assert_eq!(record.record.key, key::public_of(&node));
-    assert_eq!(record.record.endpoints.len(), 3);
+    assert_eq!(record.record.endpoints().len(), 3);
     record.verify().expect("the answer is signed by the key");
 }
 
@@ -148,7 +148,7 @@ async fn a_forged_record_is_rejected_by_the_server() {
     let node = key::generate();
 
     let mut forged = signed(&node, 1, endpoints());
-    forged.record.endpoints[0].port = 31337;
+    tamper_port(&mut forged, 31337);
 
     let err = client.publish(&forged).await.unwrap_err();
     assert!(matches!(err, sqns_core::Error::Signature(_)), "{err}");
@@ -171,8 +171,8 @@ async fn republishing_updates_the_record() {
         .unwrap()
         .unwrap();
     assert_eq!(record.record.serial, 2);
-    assert_eq!(record.record.endpoints.len(), 1);
-    assert_eq!(record.record.endpoints[0].port, 5300);
+    assert_eq!(record.record.endpoints().len(), 1);
+    assert_eq!(record.record.endpoints()[0].port, 5300);
 }
 
 #[tokio::test]
@@ -251,7 +251,7 @@ async fn a_record_published_to_one_server_is_pushed_to_its_peer() {
     let follower_client = client_for(&[&follower]);
     let record = follower_client.lookup(&key).await.unwrap().unwrap();
     record.verify().unwrap();
-    assert_eq!(record.record.endpoints.len(), 3);
+    assert_eq!(record.record.endpoints().len(), 3);
 }
 
 #[tokio::test]
@@ -361,8 +361,8 @@ async fn a_restarted_publisher_replaces_its_own_earlier_record() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(record.record.endpoints.len(), 1);
-    assert_eq!(record.record.endpoints[0].port, 5300);
+    assert_eq!(record.record.endpoints().len(), 1);
+    assert_eq!(record.record.endpoints()[0].port, 5300);
 
     // And the same publisher can withdraw immediately afterwards.
     restarted.withdraw(&client).await.expect("withdraw");
@@ -374,5 +374,174 @@ async fn a_restarted_publisher_replaces_its_own_earlier_record() {
             .unwrap()
             .record
             .is_withdrawal()
+    );
+}
+
+/// Alter an endpoint after signing, the way an attacker on the wire would.
+fn tamper_port(signed: &mut SignedRecord, port: u16) {
+    match &mut signed.record.body {
+        RecordBody::Live { endpoints, .. } => endpoints[0].port = port,
+        RecordBody::Revoked { .. } => panic!("no endpoints to tamper with"),
+    }
+}
+
+// -- Key compromise --
+
+fn delegation_for(identity: &SigningKey, service: &SigningKey, serial: u64) -> Delegation {
+    Delegation::issue(
+        identity,
+        key::public_of(service),
+        serial,
+        sqns_core::record::now_unix() + 86_400,
+    )
+    .expect("issue delegation")
+}
+
+fn moved_endpoints(last_octet: u8) -> Vec<Endpoint> {
+    vec![Endpoint::new(
+        Host::V4(Ipv4Addr::new(203, 0, 113, last_octet)),
+        5300,
+    )]
+}
+
+#[tokio::test]
+async fn a_stolen_service_key_is_shut_out_by_a_new_delegation() {
+    let server = start_server(vec![]).await;
+    let client = client_for(&[&server]);
+
+    // The identity key is offline; the node holds only `stolen` and d1.
+    let identity = key::generate();
+    let stolen = key::generate();
+    let fresh = key::generate();
+    let d1 = delegation_for(&identity, &stolen, 1);
+    let d2 = delegation_for(&identity, &fresh, 2);
+    let id_pub = key::public_of(&identity);
+
+    sqns_client::Publisher::delegated(id_pub, stolen.clone(), d1.clone(), endpoints(), 300)
+        .expect("publisher under d1")
+        .publish(&client)
+        .await
+        .expect("publish under d1");
+
+    let before = client.resolve_service(&id_pub).await.expect("resolve");
+    assert_eq!(before.identity, id_pub);
+    assert_eq!(before.service_key, key::public_of(&stolen));
+    assert!(before.is_delegated());
+
+    // The host is compromised. The operator brings the identity key out and
+    // delegates to a new service key.
+    sqns_client::Publisher::delegated(id_pub, fresh.clone(), d2, moved_endpoints(9), 300)
+        .expect("publisher under d2")
+        .publish(&client)
+        .await
+        .expect("publish under d2");
+
+    // The thief still holds the old service key and its delegation, and pushes
+    // the record serial as high as it will go.
+    let forged = Record::delegated(id_pub, u64::MAX, 300, d1, moved_endpoints(66))
+        .sign(&stolen)
+        .expect("the thief can still produce a valid signature");
+    let err = client.publish(&forged).await.unwrap_err();
+    assert!(
+        err.to_string().contains("delegation"),
+        "the old delegation must be refused, got: {err}"
+    );
+
+    // The identity that callers look up has not changed; the key they dial has.
+    let after = client.resolve_service(&id_pub).await.expect("resolve");
+    assert_eq!(after.identity, id_pub, "the looked-up key is stable");
+    assert_eq!(after.service_key, key::public_of(&fresh));
+    assert_eq!(after.delegation_serial, 2);
+    assert_eq!(after.endpoints, moved_endpoints(9));
+}
+
+#[tokio::test]
+async fn an_expired_delegation_stops_being_served() {
+    let server = start_server(vec![]).await;
+    let client = client_for(&[&server]);
+    let identity = key::generate();
+    let service = key::generate();
+    let id_pub = key::public_of(&identity);
+
+    // A delegation that lapsed an hour ago.
+    let lapsed = Delegation::issue(
+        &identity,
+        key::public_of(&service),
+        1,
+        sqns_core::record::now_unix() - 3600,
+    )
+    .unwrap();
+    let record = Record::delegated(id_pub, 1, 300, lapsed, endpoints())
+        .sign(&service)
+        .unwrap();
+
+    let err = client.publish(&record).await.unwrap_err();
+    assert!(
+        matches!(err, sqns_core::Error::Delegation(_)),
+        "an expired delegation must not publish, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn a_revoked_identity_is_dead_on_every_server() {
+    let follower = start_server(vec![]).await;
+    let leader = start_server(vec![follower.addr.clone()]).await;
+    let client = client_for(&[&leader]);
+
+    let identity = key::generate();
+    let id_pub = key::public_of(&identity);
+    let successor = key::public_of(&key::generate());
+    client
+        .publish(&signed(&identity, 1, endpoints()))
+        .await
+        .unwrap();
+
+    let revocation = Record::revoked(id_pub, 2, Some(successor), "host compromised")
+        .sign(&identity)
+        .unwrap();
+    client.publish(&revocation).await.expect("revoke");
+
+    // lookup still shows the tombstone, so an operator can see what happened.
+    let held = client.lookup(&id_pub).await.unwrap().expect("tombstone");
+    assert!(held.record.is_revoked());
+
+    // Anything that would dial fails closed, and names the untrusted hint.
+    let err = client.resolve_service(&id_pub).await.unwrap_err();
+    match err {
+        sqns_core::Error::Revoked {
+            successor: hint,
+            reason,
+            ..
+        } => {
+            assert_eq!(hint, Some(successor.to_string()));
+            assert_eq!(reason, "host compromised");
+        }
+        other => panic!("expected Revoked, got {other}"),
+    }
+    assert!(client.resolve(&id_pub).await.is_err());
+
+    // Nothing can be published for the key again.
+    let err = client
+        .publish(&signed(&identity, u64::MAX, endpoints()))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("revoked"), "{err}");
+
+    // And the tombstone replicates, so the peer is closed too.
+    let store = Arc::clone(&follower.store);
+    assert!(
+        eventually(Duration::from_secs(5), || store
+            .get(&id_pub)
+            .is_some_and(|r| r.record.is_revoked()))
+        .await,
+        "the revocation never reached the peer"
+    );
+    let follower_client = client_for(&[&follower]);
+    assert!(
+        follower_client
+            .publish(&signed(&identity, u64::MAX, endpoints()))
+            .await
+            .is_err(),
+        "the peer must refuse publishes for a revoked key"
     );
 }
