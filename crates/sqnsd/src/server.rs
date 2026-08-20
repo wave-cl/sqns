@@ -98,7 +98,7 @@ impl Server {
                 tracing::info!(
                     key = %key.short(),
                     serial,
-                    identity = record.record.identity().map(|i| i.short()),
+                    identity = %record.record.identity().short(),
                     terminal = record.record.is_terminal(),
                     endpoints = record.record.endpoints().len(),
                     "record stored"
@@ -266,7 +266,7 @@ pub async fn serve(bound: Bound) -> Result<()> {
 
     tokio::select! {
         _ = accept_loop => tracing::warn!("listener stopped accepting"),
-        _ = tokio::signal::ctrl_c() => tracing::info!("shutting down"),
+        signal = shutdown_signal() => tracing::info!(%signal, "shutting down"),
     }
 
     // Records outlive the process only if the snapshot is current.
@@ -303,6 +303,37 @@ async fn serve_connection(server: Arc<Server>, conn: quinn::Connection) {
             }
             let _ = send.finish();
         });
+    }
+}
+
+/// Wait for a signal asking the server to stop.
+///
+/// SIGTERM matters as much as ctrl-C here: it is what service managers send on
+/// stop, and the final snapshot is written after this returns. Missing it would
+/// lose every record published since the last periodic write — including
+/// retirement tombstones, which is the last thing that should evaporate.
+async fn shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => "SIGINT",
+                    _ = term.recv() => "SIGTERM",
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot listen for SIGTERM; ctrl-C only");
+                let _ = tokio::signal::ctrl_c().await;
+                "SIGINT"
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "ctrl-c"
     }
 }
 

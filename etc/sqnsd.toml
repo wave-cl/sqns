@@ -36,5 +36,6 @@ allow_sync = true
 sync_interval_secs = 60
 
 # How often to write the snapshot, in seconds. Writes are skipped when nothing
-# changed, and a final snapshot is written on shutdown.
+# changed, and a final snapshot is written on shutdown — on SIGTERM as well as
+# ctrl-C, so stopping via a service manager loses nothing.
 persist_interval_secs = 30
