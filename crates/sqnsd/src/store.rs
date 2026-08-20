@@ -136,15 +136,13 @@ impl Store {
         }
         // Authority that has run out is no authority: a service key whose
         // delegation lapsed cannot publish, even though its signature is good.
-        if let Some(d) = &record.record.delegation
-            && d.is_expired(now)
-            && !record.record.is_terminal()
-        {
+        let delegation = &record.record.delegation;
+        if delegation.is_expired(now) && !record.record.is_terminal() {
             return Err(Error::Delegation(format!(
                 "the delegation over {} from {} expired {}s ago",
                 record.key(),
-                d.identity,
-                now - d.not_after
+                delegation.identity,
+                now - delegation.not_after
             )));
         }
 
@@ -164,18 +162,11 @@ impl Store {
         // thief holding the key could simply drop the delegation and retire the
         // key itself, or re-bind it to an identity they control.
         if let Some(bound) = self.bindings.read().unwrap().get(&key).copied() {
-            match record.record.identity() {
-                Some(identity) if identity == bound => {}
-                Some(identity) => {
-                    return Err(Error::Delegation(format!(
-                        "{key} belongs to identity {bound}, but this record claims {identity}"
-                    )));
-                }
-                None => {
-                    return Err(Error::Delegation(format!(
-                        "{key} belongs to identity {bound}; a record for it must carry that delegation"
-                    )));
-                }
+            let identity = record.record.identity();
+            if identity != bound {
+                return Err(Error::Delegation(format!(
+                    "{key} belongs to identity {bound}, but this record claims {identity}"
+                )));
             }
         }
 
@@ -185,9 +176,7 @@ impl Store {
                 let identity = record.record.identity();
                 records.insert(key, record);
                 drop(records);
-                if let Some(identity) = identity {
-                    self.bind(key, identity);
-                }
+                self.bind(key, identity);
                 self.revision.fetch_add(1, Ordering::Relaxed);
                 Ok(PutOutcome::Stored)
             }

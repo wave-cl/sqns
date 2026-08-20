@@ -22,9 +22,19 @@ fn sample_endpoints() -> Vec<Endpoint> {
     ]
 }
 
+/// A delegation over `service` from a throwaway identity — for tests about
+/// something other than who issued the key.
+fn any_delegation(service: &SigningKey) -> Delegation {
+    Delegation::issue(
+        &key::generate(),
+        &key::public_of(service),
+        now_unix() + 86_400,
+    )
+}
+
 fn signed_sample() -> (ed25519_dalek::SigningKey, SignedRecord) {
     let sk = key::generate();
-    let record = Record::live(key::public_of(&sk), None, 7, 300, sample_endpoints());
+    let record = Record::live(key::public_of(&sk), any_delegation(&sk), 7, 300, sample_endpoints());
     let signed = record.sign(&sk).expect("sign");
     (sk, signed)
 }
@@ -78,7 +88,7 @@ fn tampering_with_the_serial_breaks_the_signature() {
 fn signing_for_someone_elses_key_is_refused() {
     let mine = key::generate();
     let theirs = key::generate();
-    let record = Record::live(key::public_of(&theirs), None, 1, 300, sample_endpoints());
+    let record = Record::live(key::public_of(&theirs), any_delegation(&theirs), 1, 300, sample_endpoints());
     assert!(
         record.sign(&mine).is_err(),
         "must not sign a record for a key we do not hold"
@@ -96,7 +106,7 @@ fn an_answer_for_the_wrong_key_is_rejected() {
 #[test]
 fn an_expired_answer_is_rejected() {
     let sk = key::generate();
-    let mut record = Record::live(key::public_of(&sk), None, 1, 60, sample_endpoints());
+    let mut record = Record::live(key::public_of(&sk), any_delegation(&sk), 1, 60, sample_endpoints());
     record.issued_at = now_unix() - 120;
     let signed = record.sign(&sk).unwrap();
     let err = signed.verify_answer(&signed.key(), now_unix()).unwrap_err();
@@ -107,8 +117,8 @@ fn an_expired_answer_is_rejected() {
 fn serial_decides_which_record_wins() {
     let sk = key::generate();
     let key = key::public_of(&sk);
-    let old = Record::live(key, None, 4, 300, sample_endpoints());
-    let new = Record::live(key, None, 5, 300, sample_endpoints());
+    let old = Record::live(key, any_delegation(&sk), 4, 300, sample_endpoints());
+    let new = Record::live(key, any_delegation(&sk), 5, 300, sample_endpoints());
     assert!(new.supersedes(&old));
     assert!(!old.supersedes(&new));
     assert!(!old.supersedes(&old));
@@ -118,16 +128,16 @@ fn serial_decides_which_record_wins() {
 fn a_refresh_at_the_same_serial_still_wins_on_time() {
     let sk = key::generate();
     let key = key::public_of(&sk);
-    let mut old = Record::live(key, None, 4, 300, sample_endpoints());
+    let mut old = Record::live(key, any_delegation(&sk), 4, 300, sample_endpoints());
     old.issued_at -= 10;
-    let new = Record::live(key, None, 4, 300, sample_endpoints());
+    let new = Record::live(key, any_delegation(&sk), 4, 300, sample_endpoints());
     assert!(new.supersedes(&old));
 }
 
 #[test]
 fn an_empty_record_is_a_withdrawal() {
     let sk = key::generate();
-    let record = Record::live(key::public_of(&sk), None, 1, 300, Vec::new());
+    let record = Record::live(key::public_of(&sk), any_delegation(&sk), 1, 300, Vec::new());
     assert!(record.is_withdrawal());
     let signed = record.sign(&sk).unwrap();
     signed.verify().expect("withdrawals are signed like any record");
@@ -137,13 +147,13 @@ fn an_empty_record_is_a_withdrawal() {
 fn ttl_bounds_are_enforced() {
     let sk = key::generate();
     let key = key::public_of(&sk);
-    assert!(Record::live(key, None, 1, 5, sample_endpoints()).validate().is_err());
+    assert!(Record::live(key, any_delegation(&sk), 1, 5, sample_endpoints()).validate().is_err());
     assert!(
-        Record::live(key, None, 1, 999_999, sample_endpoints())
+        Record::live(key, any_delegation(&sk), 1, 999_999, sample_endpoints())
             .validate()
             .is_err()
     );
-    assert!(Record::live(key, None, 1, 300, sample_endpoints()).validate().is_ok());
+    assert!(Record::live(key, any_delegation(&sk), 1, 300, sample_endpoints()).validate().is_ok());
 }
 
 #[test]
@@ -166,7 +176,7 @@ fn endpoints_parse_from_the_command_line_forms() {
 #[test]
 fn endpoints_sort_by_priority_then_weight() {
     let sk = key::generate();
-    let record = Record::live(key::public_of(&sk), None, 1, 300, sample_endpoints());
+    let record = Record::live(key::public_of(&sk), any_delegation(&sk), 1, 300, sample_endpoints());
     let ordered = record.by_priority();
     assert_eq!(ordered[0].weight, 100);
     assert_eq!(ordered[1].weight, 50);
@@ -316,7 +326,7 @@ fn issued(lifetime: u64) -> (SigningKey, SigningKey, Delegation) {
 fn live_under(service: &SigningKey, delegation: &Delegation, serial: u64) -> SignedRecord {
     Record::live(
         key::public_of(service),
-        Some(delegation.clone()),
+        delegation.clone(),
         serial,
         300,
         sample_endpoints(),
@@ -337,7 +347,7 @@ fn a_delegated_record_is_looked_up_by_its_service_key() {
 
     // The lookup index is the service key; the identity rides along.
     assert_eq!(signed.key(), key::public_of(&service));
-    assert_eq!(signed.identity(), Some(key::public_of(&identity)));
+    assert_eq!(signed.identity(), key::public_of(&identity));
 }
 
 #[test]
@@ -348,7 +358,7 @@ fn a_delegated_record_survives_a_round_trip() {
     let decoded = SignedRecord::decode(&signed.encode()).expect("decode");
     assert_eq!(decoded, signed);
     decoded.verify().expect("signatures survive the round trip");
-    assert_eq!(decoded.identity(), Some(key::public_of(&identity)));
+    assert_eq!(decoded.identity(), key::public_of(&identity));
 }
 
 #[test]
@@ -368,7 +378,7 @@ fn a_record_signed_by_the_wrong_key_is_rejected() {
     for wrong in [&identity, &stranger] {
         let err = Record::live(
             key::public_of(&service),
-            Some(delegation.clone()),
+            delegation.clone(),
             1,
             300,
             sample_endpoints(),
@@ -385,7 +395,7 @@ fn a_swapped_delegation_breaks_verification() {
     let mut signed = live_under(&service, &delegation, 1);
 
     // Re-point the record at an identity of the attacker's choosing.
-    signed.record.delegation.as_mut().unwrap().identity = key::public_of(&key::generate());
+    signed.record.delegation.identity = key::public_of(&key::generate());
     assert!(signed.verify().is_err(), "a swapped identity must not verify");
 }
 
@@ -413,13 +423,7 @@ fn only_the_identity_may_retire_a_delegated_key() {
 
     // The identity can, and the record verifies against the key that was asked
     // for even though the identity signed it.
-    let signed = Record::superseded(
-        service_pub,
-        Some(delegation.clone()),
-        1,
-        successor,
-        "rotated",
-    )
+    let signed = Record::superseded(service_pub, delegation.clone(), 1, successor, "rotated")
     .sign(&identity)
     .expect("the identity retires the keys it issued");
     signed
@@ -428,33 +432,29 @@ fn only_the_identity_may_retire_a_delegated_key() {
     assert_eq!(signed.record.successor(), Some(successor));
 
     // The service key itself cannot — this is the whole point of the split.
-    let err = Record::superseded(service_pub, Some(delegation), 2, successor, "mine now")
+    let err = Record::superseded(service_pub, delegation, 2, successor, "mine now")
         .sign(&service)
         .unwrap_err();
     assert!(matches!(err, sqns_core::Error::Signature(_)), "{err}");
 }
 
 #[test]
-fn a_key_with_no_identity_retires_itself() {
-    let standalone = key::generate();
-    let successor = key::public_of(&key::generate());
+fn a_key_cannot_be_its_own_identity() {
+    // Otherwise the key would be its own authority again, by the back door:
+    // whoever held it could retire it.
+    let sk = key::generate();
+    let pubkey = key::public_of(&sk);
+    let self_issued = Delegation::issue(&sk, &pubkey, now_unix() + 86_400);
 
-    let signed = Record::superseded(key::public_of(&standalone), None, 1, successor, "rotated")
-        .sign(&standalone)
-        .expect("a standalone key may rotate itself");
-    signed.verify().expect("verify");
-    assert_eq!(signed.record.successor(), Some(successor));
+    let record = Record::live(pubkey, self_issued, 1, 300, sample_endpoints());
+    let err = record.validate().unwrap_err();
+    assert!(matches!(err, sqns_core::Error::Delegation(_)), "{err}");
 }
 
 #[test]
 fn a_revocation_reports_itself_and_has_no_successor() {
     let (identity, service, delegation) = issued(86_400);
-    let signed = Record::revoked(
-        key::public_of(&service),
-        Some(delegation),
-        1,
-        "laptop stolen",
-    )
+    let signed = Record::revoked(key::public_of(&service), delegation, 1, "laptop stolen")
     .sign(&identity)
     .expect("sign");
 
@@ -474,7 +474,7 @@ fn a_key_cannot_be_superseded_by_itself() {
     let sk = key::generate();
     let key = key::public_of(&sk);
     assert!(
-        Record::superseded(key, None, 1, key, "loop")
+        Record::superseded(key, any_delegation(&sk), 1, key, "loop")
             .validate()
             .is_err()
     );
@@ -486,15 +486,16 @@ fn retirement_never_expires_and_outranks_everything() {
     let key = key::public_of(&sk);
     let successor = key::public_of(&key::generate());
 
+    let d = any_delegation(&sk);
     for retired in [
-        Record::superseded(key, None, 1, successor, "rotated"),
-        Record::revoked(key, None, 1, "stolen"),
+        Record::superseded(key, d.clone(), 1, successor, "rotated"),
+        Record::revoked(key, d.clone(), 1, "stolen"),
     ] {
         let mut aged = retired.clone();
         aged.issued_at = now_unix() - 10 * 365 * 86_400;
         assert!(!aged.is_expired(now_unix()), "tombstones do not lapse");
 
-        let later = Record::live(key, None, u64::MAX, 300, sample_endpoints());
+        let later = Record::live(key, any_delegation(&sk), u64::MAX, 300, sample_endpoints());
         assert!(retired.supersedes(&later));
         assert!(!later.supersedes(&retired), "nothing supersedes a retirement");
     }
@@ -507,8 +508,8 @@ fn retirement_records_survive_a_round_trip() {
     let service_pub = key::public_of(&service);
 
     for record in [
-        Record::superseded(service_pub, Some(delegation.clone()), 4, successor, "rotated"),
-        Record::revoked(service_pub, Some(delegation), 5, "stolen"),
+        Record::superseded(service_pub, delegation.clone(), 4, successor, "rotated"),
+        Record::revoked(service_pub, delegation, 5, "stolen"),
     ] {
         let signed = record.sign(&identity).unwrap();
         let decoded = SignedRecord::decode(&signed.encode()).unwrap();

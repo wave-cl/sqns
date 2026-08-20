@@ -64,8 +64,8 @@ pub struct ServiceLocation {
     /// The key actually reached, and the one to pin for the sQUIC handshake.
     /// It differs from `requested` when the key has been rotated.
     pub key: PubKey,
-    /// The identity that issued `key`, if it carries a delegation.
-    pub identity: Option<PubKey>,
+    /// The identity that issued `key`.
+    pub identity: PubKey,
     /// Endpoints in the order they should be tried.
     pub endpoints: Vec<Endpoint>,
     /// Keys walked through to get here, oldest first. Empty when the requested
@@ -100,6 +100,16 @@ impl Rank {
     }
 }
 
+/// What this resolver has already established about a key.
+#[derive(Debug, Clone, Copy)]
+struct Seen {
+    rank: Rank,
+    /// The identity behind the key. It must never change: a key that suddenly
+    /// answers to someone else is a thief who minted their own delegation, not
+    /// a rotation. Rotation moves to a *different* key and says so.
+    identity: PubKey,
+}
+
 /// Resolves public keys to endpoints, and publishes records.
 ///
 /// Connections are kept open and reused; a server that fails is re-dialed on
@@ -108,10 +118,10 @@ pub struct Resolver {
     config: ResolverConfig,
     conns: Vec<Mutex<Option<quinn::Connection>>>,
     cache: Arc<Cache>,
-    /// Highest authority seen per identity, kept whether or not answers are
-    /// cached. A server that replays an older record — a stale delegation, or a
-    /// live record after a revocation — is refused here.
-    marks: StdMutex<HashMap<PubKey, Rank>>,
+    /// What has been established about each key, kept whether or not answers
+    /// are cached. A server that replays an older record, or hands back one
+    /// answering to a different identity, is refused here.
+    marks: StdMutex<HashMap<PubKey, Seen>>,
 }
 
 impl Resolver {
@@ -187,18 +197,28 @@ impl Resolver {
         }
     }
 
-    /// Record the authority of an answer, refusing anything below what this
-    /// resolver has already seen for the same key.
+    /// Record what an answer establishes about a key, refusing anything that
+    /// contradicts what this resolver has already seen for it.
     fn note_rank(&self, record: &SignedRecord) -> Result<()> {
-        let rank = Rank::of(&record.record);
+        let seen = Seen {
+            rank: Rank::of(&record.record),
+            identity: record.identity(),
+        };
+        let key = record.key();
         let mut marks = self.marks.lock().unwrap();
-        match marks.get(&record.key()) {
-            Some(seen) if rank < *seen => Err(Error::Downgrade(record.key().to_string())),
-            _ => {
-                marks.insert(record.key(), rank);
-                Ok(())
+        if let Some(before) = marks.get(&key) {
+            if before.identity != seen.identity {
+                return Err(Error::Delegation(format!(
+                    "{key} was issued by {}, but this answer claims {}",
+                    before.identity, seen.identity
+                )));
+            }
+            if seen.rank < before.rank {
+                return Err(Error::Downgrade(key.to_string()));
             }
         }
+        marks.insert(key, seen);
+        Ok(())
     }
 
     /// Like [`lookup`], but refuses a key that has been retired.
@@ -303,7 +323,7 @@ impl Resolver {
                     // really be issued by the identity we asked about.
                     let key = rec.key();
                     rec.verify_answer(&key, now)?;
-                    if rec.identity() != Some(*identity) {
+                    if rec.identity() != *identity {
                         return Err(Error::Delegation(format!(
                             "{key} was listed under {identity} but is not issued by it"
                         )));
@@ -464,38 +484,84 @@ fn unexpected(resp: Response) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::SigningKey;
     use sqns_core::key::{generate, public_of};
-    use sqns_core::record::{Host, Record};
+    use sqns_core::record::{Delegation, Host, Record};
     use std::net::Ipv4Addr;
 
-    /// A resolver pointed at an address it never dials — enough to exercise the
-    /// downgrade guard, which runs before any answer is trusted.
-    fn offline_resolver() -> Resolver {
-        let key = public_of(&generate());
-        Resolver::single(ServerAddr::new("127.0.0.1", 1, key)).expect("resolver")
+    /// A service key and the identity that issued it.
+    struct Service {
+        identity: SigningKey,
+        key: SigningKey,
+        delegation: Delegation,
     }
 
-    fn endpoints() -> Vec<Endpoint> {
-        vec![Endpoint::new(Host::V4(Ipv4Addr::LOCALHOST), 5300)]
+    impl Service {
+        fn new() -> Self {
+            let identity = generate();
+            let key = generate();
+            let delegation =
+                Delegation::issue(&identity, &public_of(&key), now_unix() + 86_400);
+            Self {
+                identity,
+                key,
+                delegation,
+            }
+        }
+
+        fn pubkey(&self) -> PubKey {
+            public_of(&self.key)
+        }
+
+        fn live(&self, serial: u64) -> SignedRecord {
+            Record::live(
+                self.pubkey(),
+                self.delegation.clone(),
+                serial,
+                300,
+                vec![Endpoint::new(Host::V4(Ipv4Addr::LOCALHOST), 5300)],
+            )
+            .sign(&self.key)
+            .unwrap()
+        }
+
+        fn revoked(&self, serial: u64) -> SignedRecord {
+            Record::revoked(self.pubkey(), self.delegation.clone(), serial, "stolen")
+                .sign(&self.identity)
+                .unwrap()
+        }
+
+        fn superseded(&self, serial: u64) -> SignedRecord {
+            Record::superseded(
+                self.pubkey(),
+                self.delegation.clone(),
+                serial,
+                public_of(&generate()),
+                "rotated",
+            )
+            .sign(&self.identity)
+            .unwrap()
+        }
+    }
+
+    /// A resolver pointed at an address it never dials — enough to exercise the
+    /// guards, which run before any answer is trusted.
+    fn offline_resolver() -> Resolver {
+        Resolver::single(ServerAddr::new("127.0.0.1", 1, public_of(&generate()))).expect("resolver")
     }
 
     #[test]
     fn a_server_cannot_follow_a_retirement_with_a_live_record() {
-        let node = generate();
-        let key = public_of(&node);
-        let successor = public_of(&generate());
-
-        for retired in [
-            Record::superseded(key, None, 1, successor, "rotated"),
-            Record::revoked(key, None, 1, "stolen"),
-        ] {
+        for retired in [Service::new().superseded(1), Service::new().revoked(1)] {
             let resolver = offline_resolver();
-            let tombstone = retired.sign(&node).unwrap();
-            let live = Record::live(key, None, u64::MAX, 300, endpoints())
-                .sign(&node)
-                .unwrap();
+            resolver.note_rank(&retired).expect("retirement accepted");
 
-            resolver.note_rank(&tombstone).expect("retirement accepted");
+            // A live record for the same key, at the highest serial there is.
+            let service = Service::new();
+            let mut live = service.live(u64::MAX);
+            live.record.key = retired.key();
+            live.record.delegation = retired.record.delegation.clone();
+
             let err = resolver.note_rank(&live).unwrap_err();
             assert!(matches!(err, Error::Downgrade(_)), "{err}");
         }
@@ -504,29 +570,54 @@ mod tests {
     #[test]
     fn a_server_cannot_walk_a_serial_backwards() {
         let resolver = offline_resolver();
-        let node = generate();
-        let key = public_of(&node);
+        let service = Service::new();
 
-        let newer = Record::live(key, None, 9, 300, endpoints()).sign(&node).unwrap();
-        let older = Record::live(key, None, 4, 300, endpoints()).sign(&node).unwrap();
-
-        resolver.note_rank(&newer).expect("first answer is accepted");
-        let err = resolver.note_rank(&older).unwrap_err();
+        resolver
+            .note_rank(&service.live(9))
+            .expect("first answer is accepted");
+        let err = resolver.note_rank(&service.live(4)).unwrap_err();
         assert!(matches!(err, Error::Downgrade(_)), "{err}");
-        resolver.note_rank(&newer).expect("same rank is not a downgrade");
+        resolver
+            .note_rank(&service.live(9))
+            .expect("same rank is not a downgrade");
+    }
+
+    /// A key answering to a different identity is a thief who minted their own
+    /// delegation, not a rotation — rotation moves to a different key and says
+    /// so. A resolver that has seen the key before must notice.
+    #[test]
+    fn a_key_cannot_change_the_identity_behind_it() {
+        let resolver = offline_resolver();
+        let service = Service::new();
+        resolver.note_rank(&service.live(1)).expect("first answer");
+
+        // Same service key, re-issued by an identity of the attacker's own.
+        let attacker = generate();
+        let reissued = Record::live(
+            service.pubkey(),
+            Delegation::issue(&attacker, &service.pubkey(), now_unix() + 86_400),
+            2,
+            300,
+            vec![Endpoint::new(Host::V4(Ipv4Addr::LOCALHOST), 6000)],
+        )
+        .sign(&service.key)
+        .unwrap();
+
+        // It verifies on its own — that is the point of the guard.
+        reissued.verify_answer(&service.pubkey(), now_unix()).unwrap();
+        let err = resolver.note_rank(&reissued).unwrap_err();
+        assert!(matches!(err, Error::Delegation(_)), "{err}");
     }
 
     #[test]
     fn an_ordinary_refresh_is_not_a_downgrade() {
         let resolver = offline_resolver();
-        let node = generate();
-        let key = public_of(&node);
+        let service = Service::new();
 
         for serial in 1..5 {
-            let record = Record::live(key, None, serial, 300, endpoints())
-                .sign(&node)
-                .unwrap();
-            resolver.note_rank(&record).expect("serials only go up");
+            resolver
+                .note_rank(&service.live(serial))
+                .expect("serials only go up");
         }
     }
 }

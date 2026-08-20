@@ -5,10 +5,10 @@
 //! advertised without anyone having to retract it: the publisher re-signs on a
 //! timer well inside the TTL.
 //!
-//! When the service key carries a delegation, the identity key that issued it
-//! is never in this process. That is the point: a host compromise yields a key
-//! that can publish endpoints but can never retire itself or forward anyone
-//! elsewhere, and the identity can retire it from somewhere safe.
+//! The identity key that issued the service key is never in this process. That
+//! is the point: a host compromise yields a key that can publish endpoints but
+//! can never retire itself or forward anyone elsewhere, and the identity can
+//! retire it from somewhere safe.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,7 +29,8 @@ pub const DEFAULT_TTL: u32 = 300;
 pub struct Publisher {
     /// The service key: it signs the records and is what clients look up.
     signing_key: SigningKey,
-    delegation: Option<Delegation>,
+    /// The identity's grant of authority over that key.
+    delegation: Delegation,
     endpoints: Vec<Endpoint>,
     ttl: u32,
     serial: AtomicU64,
@@ -38,22 +39,11 @@ pub struct Publisher {
 impl Publisher {
     /// The serial starts at the current wall-clock second, so a record signed
     /// after a restart still supersedes whatever the network already holds.
-    /// Publish under a standalone service key, belonging to no identity.
-    pub fn new(signing_key: SigningKey, endpoints: Vec<Endpoint>, ttl: u32) -> Self {
-        Self {
-            signing_key,
-            delegation: None,
-            endpoints,
-            ttl,
-            serial: AtomicU64::new(now_unix()),
-        }
-    }
-
     /// Publish under a service key an identity issued.
     ///
     /// Fails unless the delegation really covers this key — catching a
     /// mismatched pair here rather than on the server.
-    pub fn delegated(
+    pub fn new(
         service_key: SigningKey,
         delegation: Delegation,
         endpoints: Vec<Endpoint>,
@@ -62,7 +52,7 @@ impl Publisher {
         delegation.verify(&public_of(&service_key))?;
         Ok(Self {
             signing_key: service_key,
-            delegation: Some(delegation),
+            delegation,
             endpoints,
             ttl,
             serial: AtomicU64::new(now_unix()),
@@ -74,13 +64,13 @@ impl Publisher {
         public_of(&self.signing_key)
     }
 
-    /// The identity that issued this service key, if any.
-    pub fn identity(&self) -> Option<PubKey> {
-        self.delegation.as_ref().map(|d| d.identity)
+    /// The identity that issued this service key.
+    pub fn identity(&self) -> PubKey {
+        self.delegation.identity
     }
 
-    pub fn delegation(&self) -> Option<&Delegation> {
-        self.delegation.as_ref()
+    pub fn delegation(&self) -> &Delegation {
+        &self.delegation
     }
 
     pub fn ttl(&self) -> u32 {
