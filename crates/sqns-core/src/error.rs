@@ -56,7 +56,9 @@ pub enum Error {
     #[error("connection error: {0}")]
     Connection(String),
 
-    #[error("no sqns server answered: {0}")]
+    /// Nothing usable came back from any configured server — including there
+    /// being none configured. The message says which; it needs no prefix.
+    #[error("{0}")]
     NoServer(String),
 
     #[error("server error {code}: {message}")]

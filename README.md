@@ -36,6 +36,103 @@ trust in the server that answered.
 | Key compromise | reissue from the CA or zone | retire the key; lookups forward to its replacement |
 | Server visibility | responds to anyone | silent to anyone without its public key |
 
+## Install
+
+```
+curl -fsSL https://raw.githubusercontent.com/wave-cl/sqns/main/install.sh | sh
+```
+
+Installs `sqns` and `sqnsd` to `/usr/local/bin` (root) or `~/.local/bin`
+(non-root). Linux and macOS, x86_64 and aarch64. Run with `--server` for server
+setup: key, config, systemd unit.
+
+## Getting started
+
+Point at a server, then four commands to a published service:
+
+```bash
+export SQNS_SERVER=sqc://ns1.example.com:5300/<server key>
+
+sqns keygen --identity            # your identity key — keep this offline
+sqns keygen                       # a service key for this node
+sqns delegate                     # the identity issues it authority
+sqns publish -e 198.51.100.4:443  # publish where you can be reached
+```
+
+From anywhere:
+
+```bash
+sqns resolve <service key>
+```
+
+Keys live in `~/.sqns` (mode 0700): `identity.key`, `service.key`, and the
+delegation between them, `service.deleg`. Every command takes explicit paths
+too, which is how you run several services from one host:
+
+```bash
+sqns publish --key-file ~/.sqns/web.key --delegation ~/.sqns/web.deleg -e '198.51.100.4:443'
+```
+
+Instead of exporting `SQNS_SERVER`, you can list servers in `~/.sqns/config`,
+one `sqc://` address per line, `#` for comments.
+
+A long-running node should hold its record open, which republishes inside the
+TTL and withdraws the key on exit:
+
+```bash
+sqns publish -e '198.51.100.4:443' --ttl 300 --keepalive
+```
+
+### Three nodes, one identity
+
+Three nodes of one service are three service keys, each with its own private
+key on its own host — nothing is ever copied between machines.
+
+```bash
+# Offline, once per node
+for n in 1 2 3; do
+  sqns keygen --out ~/.sqns/ns$n.key
+  sqns delegate --service-key ~/.sqns/ns$n.key --out ~/.sqns/ns$n.deleg
+done
+
+# On each node, holding only its own key and delegation
+sqns publish --key-file ~/.sqns/ns1.key --delegation ~/.sqns/ns1.deleg \
+  -e '198.51.100.1:443'
+```
+
+Each resolves under its own public key, is rotated or revoked without touching
+the others, and the identity can list them all:
+
+```bash
+sqns identity <identity>
+```
+
+### Try it without a server
+
+```bash
+./scripts/demo.sh
+```
+
+Runs the whole thing on loopback in a temporary directory — three services
+under one identity, rotating one key, revoking another, restarting the server —
+and cleans up after itself, touching neither `~/.sqns` nor your system.
+`KEEP=1 ./scripts/demo.sh` leaves the server up so you can poke at it.
+
+## Running a server
+
+```bash
+sqnsd
+```
+
+With no arguments it generates a key on first run and prints the connection
+string clients need. Defaults are `/etc/sqns/sqnsd.key` and
+`/var/lib/sqns/records.db` as root, `~/.sqns/sqnsd.key` and
+`~/.sqns/records.db` otherwise, listening on `[::]:5300`. A
+`/etc/sqns/sqnsd.toml` is picked up automatically if it exists.
+
+`sqnsd --show-pubkey` prints the server's public key, and nothing else, for
+scripts.
+
 ## Service keys and identities
 
 The key you look up is the **service key**: the one in `sqc://host:port/<key>`,
@@ -188,91 +285,6 @@ Four states a caller can tell apart:
 | superseded | retired, and forwarding to the key that replaced it |
 | revoked | permanently dead, with no replacement |
 
-## Install
-
-```bash
-cargo install --path crates/sqnsd   # server
-cargo install --path crates/sqns    # client
-```
-
-## Try it
-
-```bash
-./scripts/demo.sh
-```
-
-Runs the whole thing on loopback in a temporary directory — three services
-under one identity, rotating one key, revoking another, restarting the server —
-and cleans up after itself. `KEEP=1 ./scripts/demo.sh` leaves the server up so
-you can poke at it, and prints the `SQNS_SERVER` to export.
-
-## Quick start
-
-Generate the server's identity and start it:
-
-```bash
-sqnsd keygen --out sqnsd.key
-sqnsd --key-file sqnsd.key --listen 0.0.0.0:5300 --state-file records.db
-```
-
-It prints the connection string clients need:
-
-```
-connection string: sqc://0.0.0.0:5300/3LGScP5aB7t9tNuFzYwxY8EK6fZ2TNZqQx2o5jgxsNgj
-```
-
-Make an identity, issue a service key from it, and publish:
-
-```bash
-export SQNS_SERVER=sqc://ns1.example.com:5300/3LGScP5aB7t9tNuFzYwxY8EK6fZ2TNZqQx2o5jgxsNgj
-
-# Where the identity key lives — offline, and never needed again until you
-# rotate or revoke.
-sqns keygen --out identity.key
-sqns keygen --out node.key
-sqns delegate --identity-key identity.key --service-key node.key --out node.deleg
-
-# On the node, which holds only node.key and node.deleg
-sqns publish --key-file node.key --delegation node.deleg \
-  -e '198.51.100.4:443,priority=10,weight=100' \
-  -e '[2001:db8::5]:443,priority=10,weight=1' \
-  -e 'backup.example.com:4433,priority=50'
-```
-
-Look it up from anywhere:
-
-```bash
-sqns lookup 2mTFsr7ozzywfcCzRENivZcWiFPpbbuejGXe61oRX1eu
-sqns resolve 2mTFsr7ozzywfcCzRENivZcWiFPpbbuejGXe61oRX1eu   # endpoints only
-```
-
-### Three nodes, one identity
-
-```bash
-# Offline, once per node — each node's private key never leaves its own host
-for n in 1 2 3; do
-  sqns keygen --out ns$n.key
-  sqns delegate --identity-key identity.key --service-key ns$n.key --out d$n.bin
-done
-
-# On each node, with only its own key and delegation
-sqns publish --key-file ns1.key --delegation d1.bin -e '198.51.100.1:443'
-```
-
-Each node resolves under its own public key, and the identity can list them:
-
-```bash
-sqns identity <identity>
-```
-
-A long-running node should hold its record open, which republishes inside the
-TTL and withdraws the key on exit:
-
-```bash
-sqns publish --key-file node.key --delegation node.deleg \
-  -e '198.51.100.4:443' --ttl 300 --keepalive
-```
-
 ## Commands
 
 | Command | Purpose |
@@ -291,7 +303,8 @@ sqns publish --key-file node.key --delegation node.deleg \
 | `sqnsd keygen` | new server identity |
 
 Servers come from `--server` (repeatable) or `$SQNS_SERVER`. Where a server
-whitelists clients, pass `--identity <keyfile>` to connect under a stable key.
+whitelists clients, pass `--client-key <keyfile>` to connect under a stable key
+on the wire — unrelated to the identity keys that issue service keys.
 
 ## Replication
 
@@ -381,6 +394,36 @@ a key that has been retired.
 Record encoding is canonical and byte-stable — it is the input to the
 signature, which covers the delegation along with everything else. See
 [`record.rs`](crates/sqns-core/src/record.rs) for the layout.
+
+## Building
+
+```bash
+cargo build --release
+cargo test --workspace
+```
+
+Binaries land in `target/release/`.
+
+## Deployment
+
+`install.sh --server` does all of this; by hand it is:
+
+```bash
+sudo cp target/release/sqns target/release/sqnsd /usr/local/bin/
+sudo mkdir -p /etc/sqns /var/lib/sqns
+sudo cp etc/sqnsd.toml /etc/sqns/
+sudo sqnsd keygen --out /etc/sqns/sqnsd.key
+```
+
+Systemd (included as `etc/sqnsd.service`):
+
+```bash
+sudo cp etc/sqnsd.service /etc/systemd/system/
+sudo systemctl enable --now sqnsd
+```
+
+Stopping is clean either way: SIGTERM writes a final snapshot before exiting,
+so nothing published since the last periodic write is lost.
 
 ## Tests
 

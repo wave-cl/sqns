@@ -15,6 +15,8 @@ PORT="${PORT:-15300}"
 KEEP="${KEEP:-}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIR="$(mktemp -d)"
+# Keep the drill out of the real ~/.sqns, whatever the caller has there.
+export SQNS_HOME="$DIR/sqns-home"
 SQNS="$ROOT/target/debug/sqns"
 SQNSD="$ROOT/target/debug/sqnsd"
 DAEMON=""

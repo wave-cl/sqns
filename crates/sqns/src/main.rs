@@ -17,6 +17,34 @@ use sqns_core::record::{
 /// Environment variable holding one or more server addresses.
 const SERVER_ENV: &str = "SQNS_SERVER";
 
+/// Conventional names inside the sqns directory.
+const IDENTITY_KEY: &str = "identity.key";
+const SERVICE_KEY: &str = "service.key";
+const SERVICE_DELEGATION: &str = "service.deleg";
+const CONFIG_FILE: &str = "config";
+
+/// A path flag, or its default inside the sqns directory.
+///
+/// Falling back creates the directory at 0700, so a first `sqns keygen` sets
+/// the permissions before anything secret lands in it.
+fn path_or_default(given: Option<PathBuf>, name: &str) -> Result<PathBuf> {
+    match given {
+        Some(path) => Ok(path),
+        None => Ok(key::ensure_sqns_dir()?.join(name)),
+    }
+}
+
+/// Load a private key, pointing at the command that would create it.
+fn load_key(path: &Path, hint: &str) -> Result<ed25519_dalek::SigningKey> {
+    if !path.exists() {
+        return Err(Error::Key(format!(
+            "no key at {} — create one with: {hint}",
+            path.display()
+        )));
+    }
+    key::load_secret_file(path)
+}
+
 #[derive(Parser)]
 #[command(name = "sqns", version, about = "Resolve sQUIC public keys to endpoints")]
 struct Cli {
@@ -35,10 +63,11 @@ struct ServerArgs {
     #[arg(short, long = "server", value_name = "URL", global = true)]
     servers: Vec<String>,
 
-    /// Hex Ed25519 seed file giving this caller a stable identity, for servers
-    /// that whitelist clients.
+    /// Hex Ed25519 seed file giving this caller a stable key on the wire, for
+    /// servers that whitelist their clients. Unrelated to the identity keys
+    /// that issue service keys.
     #[arg(long, value_name = "FILE", global = true)]
-    identity: Option<PathBuf>,
+    client_key: Option<PathBuf>,
 
     /// Connection timeout in seconds.
     #[arg(long, default_value_t = 10, global = true)]
@@ -58,14 +87,15 @@ enum Command {
     },
     /// Publish your endpoints, signed by your key.
     Publish {
-        /// Hex Ed25519 seed file for the key that signs: the delegated service
-        /// key when --delegation is given, otherwise the identity itself.
+        /// Hex Ed25519 seed file for the service key that signs this record.
+        /// Defaults to ~/.sqns/service.key.
         #[arg(short, long, value_name = "FILE")]
-        key_file: PathBuf,
+        key_file: Option<PathBuf>,
         /// Delegation file from `sqns delegate`. The identity key stays
         /// offline; only the service key and this file live on the node.
+        /// Defaults to ~/.sqns/service.deleg.
         #[arg(short = 'D', long, value_name = "FILE")]
-        delegation: PathBuf,
+        delegation: Option<PathBuf>,
         /// host:port[,priority=N][,weight=N]. Repeatable.
         #[arg(short, long = "endpoint", value_name = "ADDR", required = true)]
         endpoints: Vec<String>,
@@ -79,11 +109,13 @@ enum Command {
     /// Withdraw a key: publish a record with no endpoints. The key stays
     /// alive and can be published again later.
     Withdraw {
+        /// Defaults to ~/.sqns/service.key.
         #[arg(short, long, value_name = "FILE")]
-        key_file: PathBuf,
-        /// Delegation file from `sqns delegate`.
+        key_file: Option<PathBuf>,
+        /// Delegation file from `sqns delegate`. Defaults to
+        /// ~/.sqns/service.deleg.
         #[arg(short = 'D', long, value_name = "FILE")]
-        delegation: PathBuf,
+        delegation: Option<PathBuf>,
         #[arg(long, default_value_t = sqns_client::DEFAULT_TTL)]
         ttl: u32,
     },
@@ -95,13 +127,14 @@ enum Command {
     /// identity may issue as many service keys as it likes, and each resolves
     /// on its own.
     Delegate {
-        /// Hex Ed25519 seed file for the identity key.
+        /// Hex Ed25519 seed file for the identity key. Defaults to
+        /// ~/.sqns/identity.key.
         #[arg(short, long, value_name = "FILE")]
-        identity_key: PathBuf,
+        identity_key: Option<PathBuf>,
         /// The service key to delegate to: a base58 public key, or a path to
-        /// its private seed file.
+        /// its private seed file. Defaults to ~/.sqns/service.key.
         #[arg(long, value_name = "KEY|FILE")]
-        service_key: String,
+        service_key: Option<String>,
         /// Days the delegation stays valid.
         #[arg(long, default_value_t = DEFAULT_DELEGATION_LIFETIME / 86_400)]
         days: u64,
@@ -109,8 +142,9 @@ enum Command {
         #[arg(long, conflicts_with = "days")]
         never_expires: bool,
         /// Where to write the delegation, for the node to publish with.
+        /// Defaults to ~/.sqns/service.deleg.
         #[arg(short, long, value_name = "FILE")]
-        out: PathBuf,
+        out: Option<PathBuf>,
     },
     /// Retire a service key and forward lookups to its replacement.
     Supersede {
@@ -120,9 +154,10 @@ enum Command {
         /// The service key that replaces it.
         #[arg(long, value_name = "KEY")]
         new_key: String,
-        /// Identity key that issued the old service key.
+        /// Identity key that issued the old service key. Defaults to
+        /// ~/.sqns/identity.key.
         #[arg(short, long, value_name = "FILE")]
-        identity_key: PathBuf,
+        identity_key: Option<PathBuf>,
         /// Why the key is being retired.
         #[arg(long, default_value = "rotated")]
         reason: String,
@@ -135,9 +170,10 @@ enum Command {
         /// Revoke every service key this identity has issued.
         #[arg(long, conflicts_with = "key")]
         all: bool,
-        /// Identity key that issued the service key.
+        /// Identity key that issued the service key. Defaults to
+        /// ~/.sqns/identity.key.
         #[arg(short, long, value_name = "FILE")]
-        identity_key: PathBuf,
+        identity_key: Option<PathBuf>,
         /// Why the key is being revoked.
         #[arg(long, default_value = "revoked by the key holder")]
         reason: String,
@@ -152,9 +188,13 @@ enum Command {
     },
     /// Generate a keypair.
     Keygen {
-        /// Where to write the hex private seed (mode 0600).
+        /// Where to write the hex private seed (mode 0600). Defaults to
+        /// ~/.sqns/service.key, or ~/.sqns/identity.key with --identity.
         #[arg(short, long, value_name = "FILE")]
-        out: PathBuf,
+        out: Option<PathBuf>,
+        /// Generate an identity key rather than a service key.
+        #[arg(long)]
+        identity: bool,
         /// Overwrite an existing key file.
         #[arg(long)]
         force: bool,
@@ -182,14 +222,30 @@ fn main() -> ExitCode {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     match &cli.command {
-        Command::Keygen { out, force } => return keygen(out, *force),
+        Command::Keygen {
+            out,
+            identity,
+            force,
+        } => {
+            let name = if *identity { IDENTITY_KEY } else { SERVICE_KEY };
+            let path = path_or_default(out.clone(), name)?;
+            return keygen(&path, *identity, *force);
+        }
         Command::Delegate {
             identity_key,
             service_key,
             days,
             never_expires,
             out,
-        } => return delegate(identity_key, service_key, *days, *never_expires, out),
+        } => {
+            let identity_path = path_or_default(identity_key.clone(), IDENTITY_KEY)?;
+            let service = match service_key {
+                Some(value) => value.clone(),
+                None => path_or_default(None, SERVICE_KEY)?.display().to_string(),
+            };
+            let out_path = path_or_default(out.clone(), SERVICE_DELEGATION)?;
+            return delegate(&identity_path, &service, *days, *never_expires, &out_path);
+        }
         _ => {}
     }
 
@@ -251,13 +307,14 @@ async fn run_async(command: Command, server: ServerArgs) -> Result<()> {
             ttl,
             keepalive,
         } => {
-            let signing_key = key::load_secret_file(&key_file)?;
+            let key_path = path_or_default(key_file, SERVICE_KEY)?;
+            let signing_key = load_key(&key_path, "sqns keygen")?;
             let parsed = endpoints
                 .iter()
                 .map(|e| e.parse::<Endpoint>())
                 .collect::<Result<Vec<_>>>()?;
             let resolver = std::sync::Arc::new(build_resolver(&server)?);
-            let file = load_delegation(&delegation)?;
+            let file = load_delegation(&path_or_default(delegation, SERVICE_DELEGATION)?)?;
             let publisher =
                 std::sync::Arc::new(Publisher::new(signing_key, file.delegation, parsed, ttl)?);
 
@@ -288,8 +345,8 @@ async fn run_async(command: Command, server: ServerArgs) -> Result<()> {
             delegation,
             ttl,
         } => {
-            let signing_key = key::load_secret_file(&key_file)?;
-            let file = load_delegation(&delegation)?;
+            let signing_key = load_key(&path_or_default(key_file, SERVICE_KEY)?, "sqns keygen")?;
+            let file = load_delegation(&path_or_default(delegation, SERVICE_DELEGATION)?)?;
             let resolver = build_resolver(&server)?;
             let publisher = Publisher::new(signing_key, file.delegation, Vec::new(), ttl)?;
             let serial = publisher.withdraw(&resolver).await?;
@@ -312,7 +369,10 @@ async fn run_async(command: Command, server: ServerArgs) -> Result<()> {
             new_key,
             identity_key,
             reason,
-        } => supersede(&old_key, &new_key, &identity_key, &reason, &server).await,
+        } => {
+            let identity_path = path_or_default(identity_key, IDENTITY_KEY)?;
+            supersede(&old_key, &new_key, &identity_path, &reason, &server).await
+        }
 
         Command::Revoke {
             key,
@@ -320,7 +380,10 @@ async fn run_async(command: Command, server: ServerArgs) -> Result<()> {
             identity_key,
             reason,
             yes,
-        } => revoke(key.as_deref(), all, &identity_key, &reason, yes, &server).await,
+        } => {
+            let identity_path = path_or_default(identity_key, IDENTITY_KEY)?;
+            revoke(key.as_deref(), all, &identity_path, &reason, yes, &server).await
+        }
 
         Command::Identity { key } => {
             let identity = read_pubkey(&key)?;
@@ -343,7 +406,7 @@ async fn run_async(command: Command, server: ServerArgs) -> Result<()> {
     }
 }
 
-fn keygen(out: &Path, force: bool) -> Result<()> {
+fn keygen(out: &Path, identity: bool, force: bool) -> Result<()> {
     if out.exists() && !force {
         return Err(Error::Key(format!(
             "{} already exists; pass --force to overwrite it",
@@ -354,6 +417,11 @@ fn keygen(out: &Path, force: bool) -> Result<()> {
     key::save_secret_file(out, &signing_key)?;
     println!("private key: {}", out.display());
     println!("public key:  {}", key::public_of(&signing_key));
+    if identity {
+        println!();
+        println!("This is your identity key: it issues service keys and is the only thing");
+        println!("that can retire them. Keep it off the machines that run services.");
+    }
     Ok(())
 }
 
@@ -365,7 +433,7 @@ fn delegate(
     never_expires: bool,
     out: &Path,
 ) -> Result<()> {
-    let identity = key::load_secret_file(identity_path)?;
+    let identity = load_key(identity_path, "sqns keygen --identity")?;
     let service_pub = read_pubkey(service_key)?;
     if service_pub == key::public_of(&identity) {
         return Err(Error::Delegation(
@@ -405,8 +473,12 @@ fn delegate(
 }
 
 fn load_delegation(path: &Path) -> Result<DelegationFile> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| Error::Delegation(format!("cannot read {}: {e}", path.display())))?;
+    let bytes = std::fs::read(path).map_err(|_| {
+        Error::Delegation(format!(
+            "no delegation at {} — create one with: sqns delegate",
+            path.display()
+        ))
+    })?;
     DelegationFile::decode(&bytes)
 }
 
@@ -447,7 +519,7 @@ async fn supersede(
 ) -> Result<()> {
     let old = read_pubkey(old_key)?;
     let new = read_pubkey(new_key)?;
-    let identity = key::load_secret_file(identity_path)?;
+    let identity = load_key(identity_path, "sqns keygen --identity")?;
     let delegation = retirement_delegation(&identity, &old);
 
     let record = Record::superseded(old, delegation, now_unix(), new, reason).sign(&identity)?;
@@ -472,7 +544,7 @@ async fn revoke(
     server: &ServerArgs,
 ) -> Result<()> {
     let resolver = build_resolver(server)?;
-    let identity = key::load_secret_file(identity_path)?;
+    let identity = load_key(identity_path, "sqns keygen --identity")?;
 
     let targets: Vec<PubKey> = if all {
         resolver
@@ -518,6 +590,18 @@ async fn revoke(
     Ok(())
 }
 
+/// Server addresses from `~/.sqns/config`: one `sqc://` URL per line, with
+/// `#` comments and blank lines ignored.
+///
+/// A missing file is not an error — it just means nothing is configured.
+pub fn servers_from_config(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|line| line.split('#').next().unwrap_or("").trim())
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn build_resolver(args: &ServerArgs) -> Result<Resolver> {
     let mut specs: Vec<String> = args.servers.clone();
     if specs.is_empty() && let Ok(env) = std::env::var(SERVER_ENV) {
@@ -527,9 +611,17 @@ fn build_resolver(args: &ServerArgs) -> Result<Resolver> {
             .map(str::to_string)
             .collect();
     }
+    let config_path = key::sqns_dir()?.join(CONFIG_FILE);
+    if specs.is_empty()
+        && let Ok(text) = std::fs::read_to_string(&config_path)
+    {
+        specs = servers_from_config(&text);
+    }
     if specs.is_empty() {
         return Err(Error::NoServer(format!(
-            "no server given: pass --server sqc://host:port/<key> or set {SERVER_ENV}"
+            "no server given: pass --server sqc://host:port/<key>, set {SERVER_ENV}, \
+             or list one per line in {}",
+            config_path.display()
         )));
     }
     let servers = specs
@@ -537,7 +629,7 @@ fn build_resolver(args: &ServerArgs) -> Result<Resolver> {
         .map(|s| s.parse::<ServerAddr>())
         .collect::<Result<Vec<ServerAddr>>>()?;
 
-    let client_key_hex = match &args.identity {
+    let client_key_hex = match &args.client_key {
         Some(path) => Some(sqns_client::hex_seed(&key::load_secret_file(path)?)),
         None => None,
     };
@@ -645,7 +737,17 @@ mod tests {
             vec!["sqns", "identity", "KEY"],
             vec!["sqns", "publish", "--key-file", "k", "-D", "d.bin", "-e", "1.2.3.4:5"],
             vec!["sqns", "withdraw", "--key-file", "k", "-D", "d.bin"],
-            vec!["sqns", "status", "--identity", "id.key"],
+            // Every path flag is optional now, so each command must also parse
+            // with nothing but what it truly requires.
+            vec!["sqns", "publish", "-e", "1.2.3.4:5"],
+            vec!["sqns", "withdraw"],
+            vec!["sqns", "keygen"],
+            vec!["sqns", "keygen", "--identity"],
+            vec!["sqns", "delegate"],
+            vec!["sqns", "supersede", "--old-key", "A", "--new-key", "B"],
+            vec!["sqns", "revoke", "--key", "A"],
+            vec!["sqns", "revoke", "--all"],
+            vec!["sqns", "status", "--client-key", "wire.key"],
             vec!["sqns", "keygen", "--out", "k"],
             vec!["sqns", "delegate", "--identity-key", "i", "--service-key", "s", "--out", "d"],
             vec![
@@ -668,7 +770,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{args:?} did not parse: {e}"));
             // Reading the arguments back is what trips an id collision.
             let _ = format!("{:?}", cli.server.servers);
-            let _ = format!("{:?}", cli.server.identity);
+            let _ = format!("{:?}", cli.server.client_key);
             describe_command(&cli.command);
         }
     }
@@ -692,14 +794,18 @@ mod tests {
                 ttl,
             } => format!("{key_file:?}{delegation:?}{ttl}"),
             Command::Status => "status".into(),
-            Command::Keygen { out, force } => format!("{out:?}{force}"),
+            Command::Keygen {
+                out,
+                identity,
+                force,
+            } => format!("{out:?}{identity}{force}"),
             Command::Delegate {
                 identity_key,
                 service_key,
                 days,
                 never_expires,
                 out,
-            } => format!("{identity_key:?}{service_key}{days}{never_expires}{out:?}"),
+            } => format!("{identity_key:?}{service_key:?}{days}{never_expires}{out:?}"),
             Command::Supersede {
                 old_key,
                 new_key,
@@ -714,5 +820,23 @@ mod tests {
                 yes,
             } => format!("{key:?}{all}{identity_key:?}{reason}{yes}"),
         }
+    }
+
+    #[test]
+    fn the_config_file_lists_servers_one_per_line() {
+        let text = "\
+# my servers
+sqc://ns1.example.com:5300/EFj2
+
+   sqc://ns2.example.com:5300/AbCd   # the standby
+";
+        assert_eq!(
+            super::servers_from_config(text),
+            vec![
+                "sqc://ns1.example.com:5300/EFj2".to_string(),
+                "sqc://ns2.example.com:5300/AbCd".to_string(),
+            ]
+        );
+        assert!(super::servers_from_config("# nothing but a comment\n\n").is_empty());
     }
 }

@@ -1,0 +1,14 @@
+[Unit]
+Description=sqns server daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sqnsd --config /etc/sqns/sqnsd.toml
+Restart=on-failure
+RestartSec=2
+# sqnsd writes a final snapshot on SIGTERM, so the default stop signal is right.
+StateDirectory=sqns
+
+[Install]
+WantedBy=multi-user.target

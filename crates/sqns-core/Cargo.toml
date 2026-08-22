@@ -8,7 +8,11 @@ description = "Core types, canonical record encoding and wire protocol for sqns"
 [dependencies]
 ed25519-dalek = { workspace = true }
 bs58 = { workspace = true }
+dirs = { workspace = true }
 rand_core = { workspace = true }
 hex = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

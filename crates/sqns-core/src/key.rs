@@ -8,7 +8,7 @@
 use std::fmt;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -98,6 +98,39 @@ impl From<VerifyingKey> for PubKey {
     fn from(vk: VerifyingKey) -> Self {
         Self(vk.to_bytes())
     }
+}
+
+/// Environment variable that relocates the sqns directory, for tests and for
+/// running several identities side by side.
+pub const HOME_ENV: &str = "SQNS_HOME";
+
+/// Where sqns keeps keys and configuration: `$SQNS_HOME`, else `~/.sqns`.
+pub fn sqns_dir() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os(HOME_ENV).filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(dir));
+    }
+    dirs::home_dir()
+        .map(|home| home.join(".sqns"))
+        .ok_or_else(|| Error::Key("could not determine your home directory".into()))
+}
+
+/// The sqns directory, created if absent and forced to mode 0700.
+///
+/// The permissions are re-applied even when the directory already existed:
+/// private keys live here, and a directory someone left group-readable is
+/// exactly the case worth correcting.
+pub fn ensure_sqns_dir() -> Result<PathBuf> {
+    let dir = sqns_dir()?;
+    if !dir.exists() {
+        fs::create_dir_all(&dir)?;
+    }
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    Ok(dir)
+}
+
+/// A path inside the sqns directory, e.g. `default_path("identity.key")`.
+pub fn default_path(name: &str) -> Result<PathBuf> {
+    Ok(sqns_dir()?.join(name))
 }
 
 /// Generate a fresh identity from the operating system's CSPRNG.
