@@ -90,13 +90,34 @@ impl ServerAddr {
             format!("{}:{}", self.host, self.port)
         }
     }
+
+    /// The authority as a human would write it, leaving out the port when it
+    /// is the default. Both schemes parse a missing port as
+    /// [`DEFAULT_PORT`](crate::protocol::DEFAULT_PORT), so this round-trips.
+    fn written_authority(&self) -> String {
+        if self.port != DEFAULT_PORT {
+            return self.authority();
+        }
+        if self.host.contains(':') {
+            // Keep IPv6 bracketed even without a port, so it stays unambiguous.
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        }
+    }
 }
 
 impl fmt::Display for ServerAddr {
     /// Emits the scheme the address carries, so a round trip through a config
     /// file or a log line cannot quietly downgrade an `sqns://` address.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}{}/{}", self.scheme.prefix(), self.authority(), self.key)
+        write!(
+            f,
+            "{}{}/{}",
+            self.scheme.prefix(),
+            self.written_authority(),
+            self.key
+        )
     }
 }
 

@@ -24,5 +24,12 @@ pub use key::PubKey;
 pub use protocol::{ALPN, DEFAULT_PORT, Request, Response};
 pub use record::{Delegation, DelegationFile, Endpoint, Host, Record, RecordBody, SignedRecord, now_unix};
 
+/// The public sqns server, used by the `sqns` CLI when nothing else names one.
+///
+/// This is data, not policy: a library never contacts it on its own. Only the
+/// command line falls back to it, so that `sqns resolve <key>` works before any
+/// configuration exists.
+pub const DEFAULT_SERVER: &str = "sqns://ns.squic.org/9Yb1A35fjEVVxphy5sGKfqC9fhTD9etoJQ4gVSa1jEKb";
+
 /// Crate version, reported by `Status`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

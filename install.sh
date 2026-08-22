@@ -303,8 +303,8 @@ SVC
 else
     printf "\n"
     info "Getting started:"
-    printf "  Point at a server:  export SQNS_SERVER=sqc://host:5300/<server key>\n"
-    printf "                      (or list it in ~/.sqns/config, one per line)\n\n"
+    printf "  These use the public server, sqns://ns.squic.org, unless you name\n"
+    printf "  another with SQNS_SERVER or ~/.sqns/config.\n\n"
     printf "  1. sqns keygen --identity            # your identity key — keep it offline\n"
     printf "  2. sqns keygen                       # a service key for this node\n"
     printf "  3. sqns delegate                     # the identity issues it authority\n"

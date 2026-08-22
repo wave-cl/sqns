@@ -48,15 +48,20 @@ setup: key, config, systemd unit.
 
 ## Getting started
 
-Point at a server, then four commands to a published service:
+Four commands to a published service:
 
 ```bash
-export SQNS_SERVER=sqns://ns.example.com/<server key>
-
 sqns keygen --identity            # your identity key — keep this offline
 sqns keygen                       # a service key for this node
 sqns delegate                     # the identity issues it authority
 sqns publish -e 198.51.100.4:443  # publish where you can be reached
+```
+
+That talks to the public server, `sqns://ns.squic.org`, because nothing else
+was configured. To use your own, name it once:
+
+```bash
+export SQNS_SERVER=sqns://ns.example.com/<server key>
 ```
 
 From anywhere:
@@ -74,7 +79,8 @@ sqns publish --key-file ~/.sqns/web.key --delegation ~/.sqns/web.deleg -e '198.5
 ```
 
 Instead of exporting `SQNS_SERVER`, you can list servers in `~/.sqns/config`,
-one address per line, `#` for comments.
+one address per line, `#` for comments. The order is `--server`, then
+`$SQNS_SERVER`, then that file, then the public server.
 
 A long-running node should hold its record open, which republishes inside the
 TTL and withdraws the key on exit:
@@ -160,6 +166,12 @@ instead, or allow insecure DNS.
 `sqc://` is the generic sQUIC form and promises nothing about resolution. Use
 it for IP literals, unsigned zones, and anywhere DNS is not involved. A bare
 `host:port/<key>` means the same thing.
+
+With nothing configured, the `sqns` CLI uses the public server
+`sqns://ns.squic.org/9Yb1A35fjEVVxphy5sGKfqC9fhTD9etoJQ4gVSa1jEKb`, so a fresh
+install resolves without setup. The library never does this on its own: only
+the command line applies the fallback, and `--server` or `$SQNS_SERVER` or
+`~/.sqns/config` displaces it.
 
 **Neither scheme is what keeps you safe.** The key is in the address and sQUIC
 pins it, so a forged DNS answer reaches a host that cannot complete the

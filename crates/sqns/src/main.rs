@@ -58,8 +58,9 @@ struct Cli {
 
 #[derive(Args, Clone)]
 struct ServerArgs {
-    /// sqns server as sqc://host:port/<base58 key>. Repeatable.
-    /// Defaults to $SQNS_SERVER (whitespace or comma separated).
+    /// sqns server as sqns://host/<base58 key>. Repeatable. Falls back to
+    /// $SQNS_SERVER, then ~/.sqns/config, then the public server
+    /// sqns://ns.squic.org.
     #[arg(short, long = "server", value_name = "URL", global = true)]
     servers: Vec<String>,
 
@@ -634,11 +635,14 @@ fn build_resolver(args: &ServerArgs) -> Result<Resolver> {
         specs = servers_from_config(&text);
     }
     if specs.is_empty() {
-        return Err(Error::NoServer(format!(
-            "no server given: pass --server sqc://host:port/<key>, set {SERVER_ENV}, \
-             or list one per line in {}",
-            config_path.display()
-        )));
+        // Nothing configured anywhere, so use the public server. Debug rather
+        // than warn: this is the ordinary path for someone who has just
+        // installed sqns, and it is documented in --help and the README.
+        tracing::debug!(
+            server = sqns_core::DEFAULT_SERVER,
+            "no server configured; using the public one"
+        );
+        specs.push(sqns_core::DEFAULT_SERVER.to_string());
     }
     let servers = specs
         .iter()
@@ -864,5 +868,40 @@ sqc://ns1.example.com:5300/EFj2
             ]
         );
         assert!(super::servers_from_config("# nothing but a comment\n\n").is_empty());
+    }
+
+    /// Both halves in one test: the environment is process-global, so two
+    /// tests setting these variables in parallel would race each other.
+    #[test]
+    fn the_public_server_is_used_only_when_nothing_else_names_one() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // SAFETY: single-threaded test, and the only one touching these vars.
+        unsafe {
+            std::env::set_var(sqns_core::key::HOME_ENV, dir.path());
+            std::env::remove_var(super::SERVER_ENV);
+        }
+
+        // Nothing configured: an empty sqns directory and no environment.
+        let cli = Cli::try_parse_from(["sqns", "status"]).unwrap();
+        let resolver = super::build_resolver(&cli.server).unwrap();
+        assert_eq!(resolver.servers().len(), 1);
+        assert_eq!(
+            resolver.servers()[0].to_string(),
+            sqns_core::DEFAULT_SERVER,
+            "with nothing configured, sqns should reach the public server"
+        );
+
+        // Anything else named takes precedence over it.
+        let explicit = format!(
+            "sqns://ns.example.com/{}",
+            sqns_core::key::public_of(&sqns_core::key::generate())
+        );
+        let cli = Cli::try_parse_from(["sqns", "status", "--server", &explicit]).unwrap();
+        let resolver = super::build_resolver(&cli.server).unwrap();
+        assert_eq!(resolver.servers()[0].to_string(), explicit);
+
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(sqns_core::key::HOME_ENV) };
     }
 }

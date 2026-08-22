@@ -1782,6 +1782,7 @@ dependencies = [
  "rand 0.9.5",
  "sqns-client",
  "sqns-core",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
