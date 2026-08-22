@@ -44,7 +44,9 @@ upstream_cache = true
 # Most upstream queries in flight at once.
 max_upstream_inflight = 64
 
-# Answer anti-entropy pulls, which hand the caller the whole record set.
+# Answer anti-entropy pulls, which hand the caller the whole record set in one
+# request. Peers need this. `install.sh --server` writes false for a fresh
+# server, which has none yet.
 # Peers need this; a public-facing server that should only answer point
 # lookups can set it to false.
 allow_sync = true
