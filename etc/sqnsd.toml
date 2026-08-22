@@ -27,6 +27,23 @@ peers = [
 # silently, before the QUIC handshake.
 allowed_clients = []
 
+# Servers to ask for keys this one does not hold. Unlike peers, this is one-way:
+# nothing is replicated and nothing is mirrored. A relayed answer is cached in
+# memory until it expires, never entering the store, so a leaf pointed upstream
+# stays a leaf. Clients verify records themselves, so relaying adds no trust.
+upstreams = [
+  # "sqc://ns1.example.com:5300/EFj2YJzH6MwVfPnbLdR4SjrUkA9QpXhgK7CcTx31Wm5",
+]
+
+# How long to wait on each upstream, in seconds.
+upstream_timeout_secs = 5
+
+# Keep relayed answers in memory until they expire. Turn off to always ask.
+upstream_cache = true
+
+# Most upstream queries in flight at once.
+max_upstream_inflight = 64
+
 # Answer anti-entropy pulls, which hand the caller the whole record set.
 # Peers need this; a public-facing server that should only answer point
 # lookups can set it to false.

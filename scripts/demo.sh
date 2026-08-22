@@ -107,6 +107,24 @@ step "Node 3 now fails closed, and its siblings are untouched"
 printf '   node 1 -> '; "$SQNS" resolve "$NS1"
 printf '   node 2 -> '; "$SQNS" resolve "$NS2B"
 
+step "A leaf server, holding nothing, answers by asking upstream"
+# An explicit --key-file must already exist, so make one first.
+"$SQNSD" keygen --out "$DIR/leaf.key" >/dev/null
+LEAF_KEY=$("$SQNSD" --key-file "$DIR/leaf.key" --show-pubkey 2>/dev/null)
+LEAF_ADDR="sqc://127.0.0.1:$((PORT + 1))/$LEAF_KEY"
+"$SQNSD" --key-file "$DIR/leaf.key" --listen "127.0.0.1:$((PORT + 1))" \
+  --upstream "$SQNS_SERVER" >>"$DIR/leaf.log" 2>&1 &
+LEAF=$!
+for _ in $(seq 1 50); do
+  "$SQNS" --server "$LEAF_ADDR" status >/dev/null 2>&1 && break
+  sleep 0.1
+done
+printf '   via the leaf -> '; "$SQNS" --server "$LEAF_ADDR" resolve "$NS1"
+note "$("$SQNS" --server "$LEAF_ADDR" status | tr -s '\n ' ' ')"
+note "records 0: the leaf relayed that answer, it did not mirror it"
+kill "$LEAF" 2>/dev/null || true
+wait "$LEAF" 2>/dev/null || true
+
 step "Restarting the server"
 kill "$DAEMON" 2>/dev/null || true
 wait "$DAEMON" 2>/dev/null || true

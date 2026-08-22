@@ -332,6 +332,46 @@ peers = ["sqc://ns2.example.com:5300/EFj2YJzH6MwVfPnbLdR4SjrUkA9QpXhgK7CcTx31Wm5
 
 See [etc/sqnsd.toml](etc/sqnsd.toml) for every option.
 
+## Upstream resolution
+
+A server answers from its own store. Point it at **upstreams** and a miss
+becomes a question rather than a dead end:
+
+```toml
+upstreams = ["sqc://ns1.example.com:5300/EFj2YJzH6MwVfPnbLdR4SjrUkA9QpXhgK7CcTx31Wm5"]
+```
+
+That is a different relationship from `peers`. Peering is bidirectional bulk
+replication between equals; an upstream is one-way — *ask them if I don't know*
+— which is what a leaf near its users needs: resolve the whole network without
+mirroring it.
+
+**Relaying adds no trust.** A recursive DNS resolver is an intermediary you have
+to believe; here the client verifies the record's own signature, so a relaying
+server cannot alter an answer, substitute endpoints, or invent a key. Its only
+power stays the one it always had: withholding. A relaying server does check
+what it passes on, including one thing its clients cannot — whether the answer
+matches the identity that key was first bound to here.
+
+**A leaf stays a leaf.** Relayed answers are cached in memory until they expire,
+beside the store and never in it: never offered in `Sync`, never persisted,
+never listed under an identity, gone on restart. `sqns status` shows the two
+separately:
+
+```
+records:   0
+upstreams: 1
+cached:    1 (relayed, not replicated)
+```
+
+Loops terminate because a lookup carries a hop budget: clients send 4, each
+forwarding server spends one, and a server with none left answers only for
+itself. `sqns lookup --no-recurse` sets it to zero, which answers the operator's
+question of whether a server is serving a key or relaying it.
+
+An upstream that cannot be reached is reported as an error, not as "no record" —
+an outage and an absence are different answers, and the second one gets cached.
+
 ## As a library
 
 ```rust

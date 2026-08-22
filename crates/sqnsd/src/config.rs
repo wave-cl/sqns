@@ -22,6 +22,14 @@ fn default_persist_interval() -> u64 {
     30
 }
 
+fn default_upstream_timeout() -> u64 {
+    5
+}
+
+fn default_max_upstream_inflight() -> usize {
+    64
+}
+
 fn default_true() -> bool {
     true
 }
@@ -45,6 +53,23 @@ pub struct FileConfig {
     /// server's public key may connect.
     #[serde(default)]
     pub allowed_clients: Vec<String>,
+    /// Servers to ask for keys this one does not hold, as
+    /// `sqc://host:port/<base58 key>`. Distinct from `peers`: this is one-way
+    /// resolution, not replication, so a leaf can answer for the whole network
+    /// without mirroring it.
+    #[serde(default)]
+    pub upstreams: Vec<String>,
+    /// How long to wait on each upstream, in seconds.
+    #[serde(default = "default_upstream_timeout")]
+    pub upstream_timeout_secs: u64,
+    /// Keep relayed answers in memory until they expire. The cache is never
+    /// replicated, persisted, or listed under an identity.
+    #[serde(default = "default_true")]
+    pub upstream_cache: bool,
+    /// Most upstream queries in flight at once.
+    #[serde(default = "default_max_upstream_inflight")]
+    pub max_upstream_inflight: usize,
+
     /// Answer anti-entropy pulls. Turn off on a server that should not seed
     /// its whole record set to callers.
     #[serde(default = "default_true")]
@@ -64,6 +89,10 @@ pub struct Config {
     pub key_file: PathBuf,
     pub state_file: Option<PathBuf>,
     pub peers: Vec<ServerAddr>,
+    pub upstreams: Vec<ServerAddr>,
+    pub upstream_timeout: Duration,
+    pub upstream_cache: bool,
+    pub max_upstream_inflight: usize,
     pub allowed_clients: Vec<PubKey>,
     pub allow_sync: bool,
     pub sync_interval: Duration,
@@ -88,6 +117,11 @@ impl FileConfig {
             .iter()
             .map(|p| p.parse::<ServerAddr>())
             .collect::<Result<Vec<_>>>()?;
+        let upstreams = self
+            .upstreams
+            .iter()
+            .map(|u| u.parse::<ServerAddr>())
+            .collect::<Result<Vec<_>>>()?;
         let allowed_clients = self
             .allowed_clients
             .iter()
@@ -98,6 +132,10 @@ impl FileConfig {
             key_file: self.key_file,
             state_file: self.state_file,
             peers,
+            upstreams,
+            upstream_timeout: Duration::from_secs(self.upstream_timeout_secs.max(1)),
+            upstream_cache: self.upstream_cache,
+            max_upstream_inflight: self.max_upstream_inflight.max(1),
             allowed_clients,
             allow_sync: self.allow_sync,
             sync_interval: Duration::from_secs(self.sync_interval_secs.max(5)),

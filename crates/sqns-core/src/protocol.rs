@@ -24,6 +24,16 @@ pub const MAX_MESSAGE_LEN: u32 = 1 << 20;
 /// Most records a single `Sync` response will carry.
 pub const MAX_SYNC_BATCH: u16 = 512;
 
+/// Most hops a lookup may be forwarded through, whatever the caller asks for.
+///
+/// A caller does not get to spend an unbounded amount of someone else's network
+/// on one question.
+pub const MAX_RECURSE: u8 = 8;
+
+/// Hop budget a client sends by default: enough for leaf → regional → root with
+/// room to spare.
+pub const DEFAULT_RECURSE: u8 = 4;
+
 // Request frame types.
 const REQ_LOOKUP: u8 = 0x01;
 const REQ_PUBLISH: u8 = 0x02;
@@ -53,6 +63,9 @@ pub enum ErrorCode {
     NotAuthorized = 7,
     /// The key is revoked; nothing will ever be accepted for it again.
     Revoked = 8,
+    /// Every upstream this server could have asked failed or timed out. This is
+    /// not the same as "no record": the answer is unknown, not absent.
+    UpstreamFailed = 11,
     /// The key has been retired in favour of a successor.
     Superseded = 10,
     /// The record's delegation is missing, expired, or has been retired by a
@@ -71,6 +84,7 @@ impl ErrorCode {
             7 => Self::NotAuthorized,
             8 => Self::Revoked,
             10 => Self::Superseded,
+            11 => Self::UpstreamFailed,
             9 => Self::BadDelegation,
             _ => Self::Internal,
         }
@@ -81,7 +95,12 @@ impl ErrorCode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
     /// Resolve one service key to its endpoint set.
-    Lookup { key: PubKey },
+    ///
+    /// `recurse` is the number of further hops this query may be forwarded
+    /// through when a server does not hold the key. A server decrements it
+    /// before asking its own upstreams and refuses to forward at zero, which is
+    /// what makes a cycle terminate rather than spin.
+    Lookup { key: PubKey, recurse: u8 },
     /// Every service key an identity has issued, as far as this server knows.
     LookupIdentity { identity: PubKey },
     /// Publish or refresh a record. Only the record's own key can sign it.
@@ -106,9 +125,11 @@ impl Request {
     pub fn encode_payload(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         match self {
-            Self::Lookup { key } | Self::LookupIdentity { identity: key } => {
-                buf.extend_from_slice(key.as_bytes())
+            Self::Lookup { key, recurse } => {
+                buf.extend_from_slice(key.as_bytes());
+                buf.push(*recurse);
             }
+            Self::LookupIdentity { identity } => buf.extend_from_slice(identity.as_bytes()),
             Self::Publish { record } => record.encode_into(&mut buf),
             Self::Status => {}
             Self::Sync { since, limit } => {
@@ -124,6 +145,9 @@ impl Request {
         let req = match frame_type {
             REQ_LOOKUP => Self::Lookup {
                 key: PubKey::new(r.array::<32>("lookup key")?),
+                // Clamped on the way in, so a hostile caller cannot ask a
+                // server to spend more hops than the network allows.
+                recurse: r.u8("lookup recursion budget")?.min(MAX_RECURSE),
             },
             REQ_LOOKUP_IDENTITY => Self::LookupIdentity {
                 identity: PubKey::new(r.array::<32>("identity key")?),
@@ -160,7 +184,11 @@ impl Request {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusInfo {
     pub records: u64,
+    /// Records held only in the upstream cache. These are answers this server
+    /// relayed, not records it holds: they are never replicated or persisted.
+    pub cached: u64,
     pub peers: u32,
+    pub upstreams: u32,
     pub uptime_secs: u64,
     pub version: String,
 }
@@ -228,7 +256,9 @@ impl Response {
             }
             Self::Status(info) => {
                 buf.extend_from_slice(&info.records.to_be_bytes());
+                buf.extend_from_slice(&info.cached.to_be_bytes());
                 buf.extend_from_slice(&info.peers.to_be_bytes());
+                buf.extend_from_slice(&info.upstreams.to_be_bytes());
                 buf.extend_from_slice(&info.uptime_secs.to_be_bytes());
                 put_string(&mut buf, &info.version);
             }
@@ -272,7 +302,9 @@ impl Response {
             },
             RESP_STATUS => Self::Status(StatusInfo {
                 records: r.u64("status records")?,
+                cached: r.u64("status cached")?,
                 peers: r.u32("status peers")?,
+                upstreams: r.u32("status upstreams")?,
                 uptime_secs: r.u64("status uptime")?,
                 version: r.string("status version")?,
             }),

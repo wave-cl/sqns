@@ -11,6 +11,7 @@ use sqns_core::record::SignedRecord;
 
 use crate::config::Config;
 use crate::replication::Replicator;
+use crate::upstream::Upstream;
 use crate::store::{PutOutcome, Store};
 
 /// How often expired records are swept.
@@ -20,6 +21,7 @@ const PURGE_INTERVAL: Duration = Duration::from_secs(60);
 struct Server {
     store: Arc<Store>,
     replicator: Arc<Replicator>,
+    upstream: Arc<Upstream>,
     allow_sync: bool,
     started: Instant,
 }
@@ -28,7 +30,9 @@ impl Server {
     fn status(&self) -> StatusInfo {
         StatusInfo {
             records: self.store.len() as u64,
+            cached: self.upstream.cached() as u64,
             peers: self.replicator.peer_count() as u32,
+            upstreams: self.upstream.len() as u32,
             uptime_secs: self.started.elapsed().as_secs(),
             version: sqns_core::VERSION.to_string(),
         }
@@ -38,24 +42,44 @@ impl Server {
     /// this never fails the connection on a bad request.
     async fn handle(self: &Arc<Self>, req: Request) -> Response {
         match req {
-            Request::Lookup { key } => {
-                let record = self.store.get(&key);
-                // A tombstone that forwards travels with the record it forwards
-                // to, so the caller resolves a rotated key in one exchange.
-                let successor = record
-                    .as_ref()
-                    .and_then(|rec| rec.record.successor())
-                    .and_then(|next| self.store.get(&next))
-                    .map(Box::new);
-                tracing::debug!(
-                    key = %key.short(),
-                    found = record.is_some(),
-                    forwarded = successor.is_some(),
-                    "lookup"
-                );
-                Response::Answer {
-                    record: record.map(Box::new),
-                    successor,
+            Request::Lookup { key, recurse } => {
+                if let Some(record) = self.store.get(&key) {
+                    // A tombstone that forwards travels with the record it
+                    // forwards to, so the caller resolves a rotated key in one
+                    // exchange.
+                    let successor = record
+                        .record
+                        .successor()
+                        .and_then(|next| self.store.get(&next))
+                        .map(Box::new);
+                    tracing::debug!(key = %key.short(), forwarded = successor.is_some(), "lookup");
+                    return Response::Answer {
+                        record: Some(Box::new(record)),
+                        successor,
+                    };
+                }
+
+                // Not ours. Ask upstream, if we have any hops left to spend.
+                if recurse == 0 || self.upstream.is_empty() {
+                    tracing::debug!(key = %key.short(), recurse, "lookup miss");
+                    return Response::Answer {
+                        record: None,
+                        successor: None,
+                    };
+                }
+                match self.upstream.lookup(&key, recurse - 1).await {
+                    Ok(Some(relayed)) => Response::Answer {
+                        record: Some(Box::new(relayed.record)),
+                        successor: relayed.successor.map(Box::new),
+                    },
+                    Ok(None) => Response::Answer {
+                        record: None,
+                        successor: None,
+                    },
+                    Err(e) => {
+                        tracing::warn!(key = %key.short(), error = %e, "upstream lookup failed");
+                        Response::error(ErrorCode::UpstreamFailed, e.to_string())
+                    }
                 }
             }
 
@@ -138,6 +162,7 @@ pub struct Bound {
     store: Arc<Store>,
     replicator: Arc<Replicator>,
     persist_interval: Duration,
+    upstream: Arc<Upstream>,
     local_addr: std::net::SocketAddr,
     public_key: sqns_core::key::PubKey,
 }
@@ -171,8 +196,16 @@ pub async fn bind(config: Config, signing_key: SigningKey) -> Result<Bound> {
     let replicator = Arc::new(Replicator::new(
         &config.peers,
         Arc::clone(&store),
-        client_key_hex,
+        client_key_hex.clone(),
         config.sync_interval,
+    ));
+    let upstream = Arc::new(Upstream::new(
+        &config.upstreams,
+        Arc::clone(&store),
+        client_key_hex,
+        config.upstream_timeout,
+        config.upstream_cache,
+        config.max_upstream_inflight,
     ));
 
     let allowed_keys = if config.allowed_clients.is_empty() {
@@ -202,6 +235,7 @@ pub async fn bind(config: Config, signing_key: SigningKey) -> Result<Bound> {
     let server = Arc::new(Server {
         store: Arc::clone(&store),
         replicator: Arc::clone(&replicator),
+        upstream: Arc::clone(&upstream),
         allow_sync: config.allow_sync,
         started: Instant::now(),
     });
@@ -216,6 +250,7 @@ pub async fn bind(config: Config, signing_key: SigningKey) -> Result<Bound> {
         store,
         replicator,
         persist_interval: config.persist_interval,
+        upstream: Arc::clone(&upstream),
         local_addr,
         public_key: public_of(&signing_key),
     })
@@ -229,6 +264,7 @@ pub async fn serve(bound: Bound) -> Result<()> {
         store,
         replicator,
         persist_interval,
+        upstream,
         local_addr,
         public_key,
     } = bound;
@@ -238,12 +274,17 @@ pub async fn serve(bound: Bound) -> Result<()> {
         key = %public_key,
         records = store.len(),
         peers = replicator.peer_count(),
+        upstreams = upstream.len(),
         "sqnsd {} listening", sqns_core::VERSION
     );
     tracing::info!("connection string: sqc://{local_addr}/{public_key}");
 
     tokio::spawn(Arc::clone(&replicator).run());
-    tokio::spawn(maintenance(Arc::clone(&store), persist_interval));
+    tokio::spawn(maintenance(
+        Arc::clone(&store),
+        Arc::clone(&upstream),
+        persist_interval,
+    ));
 
     let accept_loop = async {
         while let Some(incoming) = listener.accept().await {
@@ -343,7 +384,7 @@ pub async fn run(config: Config, signing_key: SigningKey) -> Result<()> {
 }
 
 /// Sweep expired records and write the snapshot when something changed.
-async fn maintenance(store: Arc<Store>, persist_interval: Duration) {
+async fn maintenance(store: Arc<Store>, upstream: Arc<Upstream>, persist_interval: Duration) {
     let mut purge = tokio::time::interval(PURGE_INTERVAL);
     let mut persist = tokio::time::interval(persist_interval);
     purge.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -356,6 +397,10 @@ async fn maintenance(store: Arc<Store>, persist_interval: Duration) {
                 let removed = store.purge_expired();
                 if removed > 0 {
                     tracing::info!(removed, "expired records swept");
+                }
+                let dropped = upstream.purge();
+                if dropped > 0 {
+                    tracing::debug!(dropped, "expired relay cache entries dropped");
                 }
             }
             _ = persist.tick() => {

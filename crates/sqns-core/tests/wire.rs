@@ -217,7 +217,10 @@ fn server_addresses_parse() {
 fn requests_round_trip() {
     let (_, signed) = signed_sample();
     let cases = vec![
-        Request::Lookup { key: signed.key() },
+        Request::Lookup {
+            key: signed.key(),
+            recurse: 4,
+        },
         Request::LookupIdentity { identity: signed.key() },
         Request::Publish {
             record: Box::new(signed.clone()),
@@ -270,7 +273,9 @@ fn responses_round_trip() {
             0x83,
             Response::Status(StatusInfo {
                 records: 3,
+                cached: 7,
                 peers: 2,
+                upstreams: 1,
                 uptime_secs: 900,
                 version: "0.1.0".into(),
             }),
@@ -541,4 +546,32 @@ fn a_tampered_delegation_file_is_refused() {
     bytes[last] ^= 0xff;
     assert!(sqns_core::record::DelegationFile::decode(&bytes).is_err());
     assert!(sqns_core::record::DelegationFile::decode(b"not a delegation").is_err());
+}
+
+#[test]
+fn a_lookup_carries_a_recursion_budget() {
+    let (_, signed) = signed_sample();
+
+    for recurse in [0u8, 1, sqns_core::protocol::DEFAULT_RECURSE] {
+        let req = Request::Lookup {
+            key: signed.key(),
+            recurse,
+        };
+        assert_eq!(Request::decode(0x01, &req.encode_payload()).unwrap(), req);
+    }
+
+    // A caller does not get to spend an unbounded amount of someone else's
+    // network on one question.
+    let greedy = Request::Lookup {
+        key: signed.key(),
+        recurse: 255,
+    };
+    let decoded = Request::decode(0x01, &greedy.encode_payload()).unwrap();
+    assert_eq!(
+        decoded,
+        Request::Lookup {
+            key: signed.key(),
+            recurse: sqns_core::protocol::MAX_RECURSE,
+        }
+    );
 }

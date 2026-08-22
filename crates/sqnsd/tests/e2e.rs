@@ -16,6 +16,8 @@ use sqnsd::server;
 struct TestServer {
     addr: ServerAddr,
     store: Arc<sqnsd::Store>,
+    #[allow(dead_code)]
+    task: tokio::task::JoinHandle<()>,
 }
 
 fn test_config(peers: Vec<ServerAddr>) -> Config {
@@ -24,6 +26,10 @@ fn test_config(peers: Vec<ServerAddr>) -> Config {
         key_file: "unused".into(),
         state_file: None,
         peers,
+        upstreams: Vec::new(),
+        upstream_timeout: Duration::from_secs(2),
+        upstream_cache: true,
+        max_upstream_inflight: 8,
         allowed_clients: Vec::new(),
         allow_sync: true,
         // Short enough that a test can wait for a pull.
@@ -36,15 +42,22 @@ async fn start_server(peers: Vec<ServerAddr>) -> TestServer {
     start_server_with(test_config(peers)).await
 }
 
+/// A server that holds nothing of its own and forwards misses upstream.
+async fn start_leaf(upstreams: Vec<ServerAddr>) -> TestServer {
+    let mut config = test_config(vec![]);
+    config.upstreams = upstreams;
+    start_server_with(config).await
+}
+
 async fn start_server_with(config: Config) -> TestServer {
     let signing_key = key::generate();
     let bound = server::bind(config, signing_key).await.expect("bind");
     let addr = ServerAddr::new("127.0.0.1", bound.local_addr().port(), bound.public_key());
     let store = Arc::clone(bound.store());
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let _ = server::serve(bound).await;
     });
-    TestServer { addr, store }
+    TestServer { addr, store, task }
 }
 
 fn client_for(servers: &[&TestServer]) -> Resolver {
@@ -54,6 +67,7 @@ fn client_for(servers: &[&TestServer]) -> Resolver {
         connect_timeout: Duration::from_secs(5),
         // Tests assert on what the server holds, not on a local cache.
         cache: false,
+        recurse: sqns_core::protocol::DEFAULT_RECURSE,
     })
     .expect("resolver")
 }
@@ -381,6 +395,7 @@ async fn a_client_falls_back_to_the_next_server() {
         client_key_hex: None,
         connect_timeout: Duration::from_millis(500),
         cache: false,
+        recurse: sqns_core::protocol::DEFAULT_RECURSE,
     })
     .unwrap();
 
@@ -696,3 +711,186 @@ async fn a_retirement_replicates_to_peers() {
     );
 }
 
+
+// -- Upstream resolution --
+
+#[tokio::test]
+async fn a_leaf_answers_for_a_key_it_does_not_hold() {
+    let origin = start_server(vec![]).await;
+    let leaf = start_leaf(vec![origin.addr.clone()]).await;
+
+    // Published only at the origin.
+    let service = Service::new();
+    service
+        .publisher(moved_endpoints(7))
+        .publish(&client_for(&[&origin]))
+        .await
+        .unwrap();
+    assert_eq!(leaf.store.len(), 0, "the leaf starts empty");
+
+    let location = client_for(&[&leaf])
+        .resolve_service(&service.pubkey())
+        .await
+        .expect("the leaf relays the answer");
+    assert_eq!(location.key, service.pubkey());
+    assert_eq!(location.endpoints, moved_endpoints(7));
+
+    // And the whole point: relaying did not make the leaf a mirror.
+    assert_eq!(leaf.store.len(), 0, "a relayed record must not enter the store");
+    let (records, _) = leaf.store.since(0, 100);
+    assert!(records.is_empty(), "a relayed record must never be replicated");
+    assert!(
+        leaf.store.identity_of(&service.pubkey()).is_none(),
+        "a relayed record must not bind an identity locally"
+    );
+}
+
+#[tokio::test]
+async fn a_relayed_answer_is_cached_beside_the_store() {
+    let origin = start_server(vec![]).await;
+    let leaf = start_leaf(vec![origin.addr.clone()]).await;
+    let service = Service::new();
+    service
+        .publisher(endpoints())
+        .publish(&client_for(&[&origin]))
+        .await
+        .unwrap();
+
+    let client = client_for(&[&leaf]);
+    let before = client.status().await.unwrap();
+    assert_eq!((before.records, before.cached), (0, 0));
+    assert_eq!(before.upstreams, 1);
+
+    client
+        .resolve_service(&service.pubkey())
+        .await
+        .expect("first lookup goes upstream");
+
+    let after = client.status().await.unwrap();
+    assert_eq!(after.cached, 1, "the answer is held in the relay cache");
+    assert_eq!(
+        after.records, 0,
+        "and nowhere near the store, which is what keeps a leaf a leaf"
+    );
+
+    // Served again without the store ever gaining a record.
+    client.resolve_service(&service.pubkey()).await.unwrap();
+    assert_eq!(client.status().await.unwrap().records, 0);
+}
+
+#[tokio::test]
+async fn no_recurse_asks_only_what_the_server_itself_holds() {
+    let origin = start_server(vec![]).await;
+    let leaf = start_leaf(vec![origin.addr.clone()]).await;
+    let service = Service::new();
+    service
+        .publisher(endpoints())
+        .publish(&client_for(&[&origin]))
+        .await
+        .unwrap();
+
+    let strict = Resolver::new(ResolverConfig {
+        servers: vec![leaf.addr.clone()],
+        client_key_hex: None,
+        connect_timeout: Duration::from_secs(5),
+        cache: false,
+        recurse: 0,
+    })
+    .unwrap();
+
+    assert!(
+        strict.lookup(&service.pubkey()).await.unwrap().is_none(),
+        "with no hops to spend, the leaf answers only for itself"
+    );
+    // The same leaf, asked normally, does relay it.
+    assert!(
+        client_for(&[&leaf])
+            .lookup(&service.pubkey())
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn two_servers_pointed_at_each_other_do_not_loop() {
+    let a = start_server(vec![]).await;
+    let b = start_leaf(vec![a.addr.clone()]).await;
+    // Point a at b as well, after b exists.
+    let mut config = test_config(vec![]);
+    config.upstreams = vec![b.addr.clone()];
+    let c = start_server_with(config).await;
+
+    let unknown = key::public_of(&key::generate());
+    // Whichever way round, the hop budget runs out instead of spinning.
+    for server in [&b, &c] {
+        let answer = tokio::time::timeout(
+            Duration::from_secs(10),
+            client_for(&[server]).lookup(&unknown),
+        )
+        .await
+        .expect("a cycle must terminate rather than hang");
+        assert!(answer.unwrap().is_none());
+    }
+}
+
+#[tokio::test]
+async fn a_chain_resolves_while_the_budget_lasts() {
+    let root = start_server(vec![]).await;
+    let mid = start_leaf(vec![root.addr.clone()]).await;
+    let leaf = start_leaf(vec![mid.addr.clone()]).await;
+
+    let service = Service::new();
+    service
+        .publisher(moved_endpoints(3))
+        .publish(&client_for(&[&root]))
+        .await
+        .unwrap();
+
+    // Two hops: leaf asks mid, mid asks root.
+    let plenty = Resolver::new(ResolverConfig {
+        servers: vec![leaf.addr.clone()],
+        client_key_hex: None,
+        connect_timeout: Duration::from_secs(5),
+        cache: false,
+        recurse: 2,
+    })
+    .unwrap();
+    assert!(plenty.lookup(&service.pubkey()).await.unwrap().is_some());
+
+    // One hop only reaches mid, which holds nothing and may not forward.
+    let stingy = Resolver::new(ResolverConfig {
+        servers: vec![leaf.addr.clone()],
+        client_key_hex: None,
+        connect_timeout: Duration::from_secs(5),
+        cache: false,
+        recurse: 1,
+    })
+    .unwrap();
+    let fresh = Service::new();
+    fresh
+        .publisher(endpoints())
+        .publish(&client_for(&[&root]))
+        .await
+        .unwrap();
+    assert!(
+        stingy.lookup(&fresh.pubkey()).await.unwrap().is_none(),
+        "one hop cannot reach two servers away"
+    );
+}
+
+#[tokio::test]
+async fn an_unreachable_upstream_is_an_error_not_an_absence() {
+    // An upstream that is not listening at all.
+    let dead = ServerAddr::new("127.0.0.1", 1, key::public_of(&key::generate()));
+    let leaf = start_leaf(vec![dead]).await;
+
+    let err = client_for(&[&leaf])
+        .lookup(&key::public_of(&key::generate()))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("upstream"),
+        "an outage must not be relayed as 'no record': {err}"
+    );
+}

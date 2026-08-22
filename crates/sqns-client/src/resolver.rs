@@ -8,7 +8,7 @@ use ed25519_dalek::SigningKey;
 use sqns_core::addr::ServerAddr;
 use sqns_core::error::{Error, Result};
 use sqns_core::key::PubKey;
-use sqns_core::protocol::{ErrorCode, Request, Response, StatusInfo};
+use sqns_core::protocol::{DEFAULT_RECURSE, ErrorCode, Request, Response, StatusInfo};
 use sqns_core::record::{Endpoint, Record, SignedRecord, now_unix};
 use tokio::sync::Mutex;
 
@@ -28,6 +28,9 @@ pub struct ResolverConfig {
     pub connect_timeout: Duration,
     /// Cache answers until they expire.
     pub cache: bool,
+    /// How many hops a lookup may be forwarded through by servers that do not
+    /// hold the key. Zero asks each server for what it holds itself.
+    pub recurse: u8,
 }
 
 impl Default for ResolverConfig {
@@ -37,6 +40,7 @@ impl Default for ResolverConfig {
             client_key_hex: None,
             connect_timeout: Duration::from_secs(10),
             cache: true,
+            recurse: DEFAULT_RECURSE,
         }
     }
 }
@@ -172,7 +176,13 @@ impl Resolver {
             return Ok((hit, None));
         }
         let response = self
-            .try_servers(Request::Lookup { key: *key }, "lookup")
+            .try_servers(
+                Request::Lookup {
+                    key: *key,
+                    recurse: self.config.recurse,
+                },
+                "lookup",
+            )
             .await?;
         match response {
             Response::Answer {

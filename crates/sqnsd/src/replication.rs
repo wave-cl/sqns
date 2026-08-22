@@ -9,19 +9,18 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use sqns_client::conn;
 use sqns_core::addr::ServerAddr;
 use sqns_core::error::{Error, Result};
 use sqns_core::protocol::{MAX_SYNC_BATCH, Request, Response};
 use sqns_core::record::SignedRecord;
 use tokio::sync::Mutex;
 
+use crate::link::PeerLink;
 use crate::store::Store;
 
-/// A replication peer and the connection we keep to it.
+/// A replication peer and how far through its records we have got.
 struct Peer {
-    addr: ServerAddr,
-    conn: Mutex<Option<quinn::Connection>>,
+    link: PeerLink,
     /// Highest `issued_at` pulled so far; the next pull starts here.
     watermark: Mutex<u64>,
 }
@@ -30,11 +29,7 @@ struct Peer {
 pub struct Replicator {
     peers: Vec<Peer>,
     store: Arc<Store>,
-    /// This server's own key, used as the client identity toward peers so a
-    /// peer that whitelists clients can allow us.
-    client_key_hex: String,
     sync_interval: Duration,
-    connect_timeout: Duration,
 }
 
 impl Replicator {
@@ -48,15 +43,16 @@ impl Replicator {
             peers: peers
                 .iter()
                 .map(|addr| Peer {
-                    addr: addr.clone(),
-                    conn: Mutex::new(None),
+                    link: PeerLink::new(
+                        addr.clone(),
+                        client_key_hex.clone(),
+                        Duration::from_secs(10),
+                    ),
                     watermark: Mutex::new(0),
                 })
                 .collect(),
             store,
-            client_key_hex,
             sync_interval,
-            connect_timeout: Duration::from_secs(10),
         }
     }
 
@@ -76,18 +72,18 @@ impl Replicator {
             record: Box::new(record.clone()),
         };
         for peer in &self.peers {
-            match self.request(peer, &req).await {
+            match peer.link.request(&req).await {
                 Ok(Response::Published { .. }) => {
-                    tracing::debug!(peer = %peer.addr, key = %record.key().short(), "pushed");
+                    tracing::debug!(peer = %peer.link.addr(), key = %record.key().short(), "pushed");
                 }
                 // The peer already has this record or something newer.
                 Ok(Response::Error { code, .. }) => {
-                    tracing::trace!(peer = %peer.addr, ?code, "push not applied");
+                    tracing::trace!(peer = %peer.link.addr(), ?code, "push not applied");
                 }
                 Ok(other) => {
-                    tracing::debug!(peer = %peer.addr, ?other, "unexpected push response");
+                    tracing::debug!(peer = %peer.link.addr(), ?other, "unexpected push response");
                 }
-                Err(e) => tracing::debug!(peer = %peer.addr, error = %e, "push failed"),
+                Err(e) => tracing::debug!(peer = %peer.link.addr(), error = %e, "push failed"),
             }
         }
     }
@@ -103,9 +99,9 @@ impl Replicator {
             ticker.tick().await;
             for peer in &self.peers {
                 match self.pull(peer).await {
-                    Ok(0) => tracing::trace!(peer = %peer.addr, "in sync"),
-                    Ok(n) => tracing::info!(peer = %peer.addr, records = n, "pulled records"),
-                    Err(e) => tracing::warn!(peer = %peer.addr, error = %e, "sync failed"),
+                    Ok(0) => tracing::trace!(peer = %peer.link.addr(), "in sync"),
+                    Ok(n) => tracing::info!(peer = %peer.link.addr(), records = n, "pulled records"),
+                    Err(e) => tracing::warn!(peer = %peer.link.addr(), error = %e, "sync failed"),
                 }
             }
         }
@@ -122,7 +118,7 @@ impl Replicator {
                 since,
                 limit: MAX_SYNC_BATCH,
             };
-            let (records, complete) = match self.request(peer, &req).await? {
+            let (records, complete) = match peer.link.request(&req).await? {
                 Response::Records { records, complete } => (records, complete),
                 other @ Response::Error { .. } => return Err(other.into_server_error()),
                 other => {
@@ -142,7 +138,7 @@ impl Replicator {
                     Ok(outcome) if outcome.stored() => applied += 1,
                     Ok(_) => {}
                     Err(e) => {
-                        tracing::warn!(peer = %peer.addr, key = %key.short(), error = %e,
+                        tracing::warn!(peer = %peer.link.addr(), key = %key.short(), error = %e,
                             "rejected record from peer");
                     }
                 }
@@ -155,7 +151,7 @@ impl Replicator {
             if batch_high <= since {
                 // More records remain but they all share our cursor's second,
                 // so another pull would return the same batch.
-                tracing::warn!(peer = %peer.addr, since,
+                tracing::warn!(peer = %peer.link.addr(), since,
                     "sync batch full with no cursor progress; remaining records deferred");
                 break;
             }
@@ -164,26 +160,4 @@ impl Replicator {
         Ok(applied)
     }
 
-    /// One exchange with a peer, re-dialing if the pooled connection is stale.
-    async fn request(&self, peer: &Peer, req: &Request) -> Result<Response> {
-        let mut slot = peer.conn.lock().await;
-        if let Some(conn) = slot.as_ref() {
-            match conn::exchange(conn, req).await {
-                Ok(resp) => return Ok(resp),
-                Err(e) => {
-                    tracing::debug!(peer = %peer.addr, error = %e, "re-dialing peer");
-                    *slot = None;
-                }
-            }
-        }
-        let conn = conn::connect(
-            &peer.addr,
-            Some(self.client_key_hex.clone()),
-            self.connect_timeout,
-        )
-        .await?;
-        let resp = conn::exchange(&conn, req).await?;
-        *slot = Some(conn);
-        Ok(resp)
-    }
 }

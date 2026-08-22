@@ -52,6 +52,12 @@ struct Cli {
     #[arg(short, long = "peer", value_name = "URL")]
     peers: Vec<String>,
 
+    /// Server to ask for keys this one does not hold, as
+    /// sqc://host:port/<base58 key>. Repeatable. Unlike a peer, this is
+    /// one-way: nothing is replicated or mirrored.
+    #[arg(short, long = "upstream", value_name = "URL")]
+    upstreams: Vec<String>,
+
     /// Refuse anti-entropy pulls from callers.
     #[arg(long)]
     no_sync: bool,
@@ -190,6 +196,10 @@ fn build_config(cli: &Cli) -> Result<Config> {
                 key_file,
                 state_file: Some(state_file),
                 peers: Vec::new(),
+                upstreams: Vec::new(),
+                upstream_timeout_secs: 5,
+                upstream_cache: true,
+                max_upstream_inflight: 64,
                 allowed_clients: Vec::new(),
                 allow_sync: true,
                 sync_interval_secs: 60,
@@ -210,6 +220,9 @@ fn build_config(cli: &Cli) -> Result<Config> {
     }
     for peer in &cli.peers {
         config.peers.push(peer.parse()?);
+    }
+    for upstream in &cli.upstreams {
+        config.upstreams.push(upstream.parse()?);
     }
     if cli.no_sync {
         config.allow_sync = false;

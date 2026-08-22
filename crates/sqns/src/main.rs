@@ -72,6 +72,12 @@ struct ServerArgs {
     /// Connection timeout in seconds.
     #[arg(long, default_value_t = 10, global = true)]
     timeout: u64,
+
+    /// Ask each server only for what it holds itself, without letting it
+    /// forward the question upstream. Answers the question "is this server
+    /// serving it, or relaying it?".
+    #[arg(long, global = true)]
+    no_recurse: bool,
 }
 
 #[derive(Subcommand)]
@@ -357,10 +363,14 @@ async fn run_async(command: Command, server: ServerArgs) -> Result<()> {
         Command::Status => {
             let resolver = build_resolver(&server)?;
             let info = resolver.status().await?;
-            println!("version:  {}", info.version);
-            println!("records:  {}", info.records);
-            println!("peers:    {}", info.peers);
-            println!("uptime:   {}", format_duration(info.uptime_secs));
+            println!("version:   {}", info.version);
+            println!("records:   {}", info.records);
+            println!("peers:     {}", info.peers);
+            if info.upstreams > 0 {
+                println!("upstreams: {}", info.upstreams);
+                println!("cached:    {} (relayed, not replicated)", info.cached);
+            }
+            println!("uptime:    {}", format_duration(info.uptime_secs));
             Ok(())
         }
 
@@ -639,6 +649,11 @@ fn build_resolver(args: &ServerArgs) -> Result<Resolver> {
         client_key_hex,
         connect_timeout: Duration::from_secs(args.timeout),
         cache: false,
+        recurse: if args.no_recurse {
+            0
+        } else {
+            sqns_core::protocol::DEFAULT_RECURSE
+        },
     })
 }
 
@@ -734,6 +749,7 @@ mod tests {
         let cases: Vec<Vec<&str>> = vec![
             vec!["sqns", "lookup", "KEY"],
             vec!["sqns", "resolve", "KEY", "--server", "sqc://h:1/K"],
+            vec!["sqns", "lookup", "KEY", "--no-recurse"],
             vec!["sqns", "identity", "KEY"],
             vec!["sqns", "publish", "--key-file", "k", "-D", "d.bin", "-e", "1.2.3.4:5"],
             vec!["sqns", "withdraw", "--key-file", "k", "-D", "d.bin"],
@@ -771,6 +787,7 @@ mod tests {
             // Reading the arguments back is what trips an id collision.
             let _ = format!("{:?}", cli.server.servers);
             let _ = format!("{:?}", cli.server.client_key);
+            let _ = cli.server.no_recurse;
             describe_command(&cli.command);
         }
     }
