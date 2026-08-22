@@ -14,6 +14,7 @@
 
 pub mod cache;
 pub mod conn;
+pub mod dns;
 pub mod publisher;
 pub mod resolver;
 pub mod select;

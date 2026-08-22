@@ -52,11 +52,14 @@ impl Upstream {
         timeout: Duration,
         cache: bool,
         max_inflight: usize,
+        require_dnssec: bool,
     ) -> Self {
         Self {
             links: addrs
                 .iter()
-                .map(|addr| PeerLink::new(addr.clone(), client_key_hex.clone(), timeout))
+                .map(|addr| {
+                    PeerLink::new(addr.clone(), client_key_hex.clone(), timeout, require_dnssec)
+                })
                 .collect(),
             cache: cache.then(Cache::new),
             store,
@@ -234,7 +237,7 @@ mod tests {
     /// An Upstream with no links: enough to exercise the checks that run before
     /// anything is relayed.
     fn checker(store: Arc<Store>) -> Upstream {
-        Upstream::new(&[], store, String::new(), Duration::from_secs(1), true, 4)
+        Upstream::new(&[], store, String::new(), Duration::from_secs(1), true, 4, true)
     }
 
     #[test]

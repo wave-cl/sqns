@@ -70,6 +70,11 @@ pub struct FileConfig {
     #[serde(default = "default_max_upstream_inflight")]
     pub max_upstream_inflight: usize,
 
+    /// Require a validated DNSSEC chain when resolving an sqns:// peer or
+    /// upstream. Turn off only on a network whose resolvers cannot carry it.
+    #[serde(default = "default_true")]
+    pub require_dnssec: bool,
+
     /// Answer anti-entropy pulls. Turn off on a server that should not seed
     /// its whole record set to callers.
     #[serde(default = "default_true")]
@@ -94,6 +99,7 @@ pub struct Config {
     pub upstream_cache: bool,
     pub max_upstream_inflight: usize,
     pub allowed_clients: Vec<PubKey>,
+    pub require_dnssec: bool,
     pub allow_sync: bool,
     pub sync_interval: Duration,
     pub persist_interval: Duration,
@@ -137,6 +143,7 @@ impl FileConfig {
             upstream_cache: self.upstream_cache,
             max_upstream_inflight: self.max_upstream_inflight.max(1),
             allowed_clients,
+            require_dnssec: self.require_dnssec,
             allow_sync: self.allow_sync,
             sync_interval: Duration::from_secs(self.sync_interval_secs.max(5)),
             persist_interval: Duration::from_secs(self.persist_interval_secs.max(1)),

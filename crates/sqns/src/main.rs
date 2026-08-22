@@ -78,6 +78,12 @@ struct ServerArgs {
     /// serving it, or relaying it?".
     #[arg(long, global = true)]
     no_recurse: bool,
+
+    /// Resolve sqns:// hostnames without requiring DNSSEC. The scheme promises
+    /// a validated chain, so this is for networks whose resolvers cannot carry
+    /// one; the pinned key still decides who you are talking to.
+    #[arg(long, global = true)]
+    insecure_dns: bool,
 }
 
 #[derive(Subcommand)]
@@ -654,6 +660,7 @@ fn build_resolver(args: &ServerArgs) -> Result<Resolver> {
         } else {
             sqns_core::protocol::DEFAULT_RECURSE
         },
+        require_dnssec: !args.insecure_dns,
     })
 }
 
@@ -750,6 +757,7 @@ mod tests {
             vec!["sqns", "lookup", "KEY"],
             vec!["sqns", "resolve", "KEY", "--server", "sqc://h:1/K"],
             vec!["sqns", "lookup", "KEY", "--no-recurse"],
+            vec!["sqns", "resolve", "KEY", "--insecure-dns"],
             vec!["sqns", "identity", "KEY"],
             vec!["sqns", "publish", "--key-file", "k", "-D", "d.bin", "-e", "1.2.3.4:5"],
             vec!["sqns", "withdraw", "--key-file", "k", "-D", "d.bin"],
@@ -788,6 +796,7 @@ mod tests {
             let _ = format!("{:?}", cli.server.servers);
             let _ = format!("{:?}", cli.server.client_key);
             let _ = cli.server.no_recurse;
+            let _ = cli.server.insecure_dns;
             describe_command(&cli.command);
         }
     }

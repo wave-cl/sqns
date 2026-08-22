@@ -62,6 +62,10 @@ struct Cli {
     #[arg(long)]
     no_sync: bool,
 
+    /// Resolve sqns:// peers and upstreams without requiring DNSSEC.
+    #[arg(long)]
+    insecure_dns: bool,
+
     /// Print this server's public key and exit.
     #[arg(long)]
     show_pubkey: bool,
@@ -197,6 +201,7 @@ fn build_config(cli: &Cli) -> Result<Config> {
                 state_file: Some(state_file),
                 peers: Vec::new(),
                 upstreams: Vec::new(),
+                require_dnssec: true,
                 upstream_timeout_secs: 5,
                 upstream_cache: true,
                 max_upstream_inflight: 64,
@@ -226,6 +231,9 @@ fn build_config(cli: &Cli) -> Result<Config> {
     }
     if cli.no_sync {
         config.allow_sync = false;
+    }
+    if cli.insecure_dns {
+        config.require_dnssec = false;
     }
     Ok(config)
 }

@@ -2,7 +2,7 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use sqns_core::addr::ServerAddr;
+use sqns_core::addr::{Scheme, ServerAddr};
 use ed25519_dalek::SigningKey;
 use sqns_core::key::{self, PubKey};
 use sqns_core::protocol::{ErrorCode, Request, Response, StatusInfo};
@@ -574,4 +574,70 @@ fn a_lookup_carries_a_recursion_budget() {
             recurse: sqns_core::protocol::MAX_RECURSE,
         }
     );
+}
+
+// -- Address schemes --
+
+#[test]
+fn the_sqns_scheme_defaults_to_port_5300() {
+    let key = key::public_of(&key::generate());
+    let addr: ServerAddr = format!("sqns://ns.example.com/{key}").parse().unwrap();
+
+    assert_eq!(addr.scheme, Scheme::Sqns);
+    assert_eq!(addr.host, "ns.example.com");
+    assert_eq!(addr.port, sqns_core::DEFAULT_PORT);
+    assert_eq!(addr.key, key);
+    assert!(addr.scheme.requires_dnssec());
+}
+
+#[test]
+fn an_explicit_port_still_works_under_sqns() {
+    let key = key::public_of(&key::generate());
+    let addr: ServerAddr = format!("sqns://ns.example.com:5301/{key}").parse().unwrap();
+    assert_eq!(addr.port, 5301);
+    assert_eq!(addr.scheme, Scheme::Sqns);
+}
+
+#[test]
+fn sqc_and_bare_addresses_promise_nothing_about_dns() {
+    let key = key::public_of(&key::generate());
+
+    for text in [
+        format!("sqc://ns.example.com:5300/{key}"),
+        format!("ns.example.com:5300/{key}"),
+    ] {
+        let addr: ServerAddr = text.parse().unwrap();
+        assert_eq!(addr.scheme, Scheme::Sqc, "{text}");
+        assert!(!addr.scheme.requires_dnssec(), "{text}");
+    }
+}
+
+#[test]
+fn display_round_trips_the_scheme() {
+    let key = key::public_of(&key::generate());
+
+    // The danger is a config file or log line quietly downgrading sqns:// to
+    // sqc://, dropping the DNSSEC requirement on the way through.
+    for text in [
+        format!("sqns://ns.example.com/{key}"),
+        format!("sqc://ns.example.com:5300/{key}"),
+        format!("sqns://[2001:db8::1]:5300/{key}"),
+    ] {
+        let addr: ServerAddr = text.parse().unwrap();
+        let printed = addr.to_string();
+        assert_eq!(printed.parse::<ServerAddr>().unwrap(), addr, "{text}");
+        assert!(printed.starts_with(addr.scheme.prefix()), "{printed}");
+    }
+}
+
+#[test]
+fn an_ip_literal_has_no_name_to_validate() {
+    let key = key::public_of(&key::generate());
+    let named: ServerAddr = format!("sqns://ns.example.com/{key}").parse().unwrap();
+    let literal: ServerAddr = format!("sqns://192.0.2.7/{key}").parse().unwrap();
+    let v6: ServerAddr = format!("sqns://[2001:db8::1]/{key}").parse().unwrap();
+
+    assert!(!named.is_ip_literal());
+    assert!(literal.is_ip_literal());
+    assert!(v6.is_ip_literal());
 }

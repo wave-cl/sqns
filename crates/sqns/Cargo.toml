@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 description = "sqns command line client"
 
+[features]
+default = ["dnssec"]
+# Validated DNSSEC resolution for sqns:// addresses. Costs ~1.5 MB of binary;
+# without it an sqns:// hostname is refused rather than resolved unvalidated.
+dnssec = ["sqns-client/dnssec"]
+
 [dependencies]
 sqns-core = { workspace = true }
 sqns-client = { workspace = true }

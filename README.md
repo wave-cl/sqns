@@ -51,7 +51,7 @@ setup: key, config, systemd unit.
 Point at a server, then four commands to a published service:
 
 ```bash
-export SQNS_SERVER=sqc://ns1.example.com:5300/<server key>
+export SQNS_SERVER=sqns://ns.example.com/<server key>
 
 sqns keygen --identity            # your identity key — keep this offline
 sqns keygen                       # a service key for this node
@@ -74,7 +74,7 @@ sqns publish --key-file ~/.sqns/web.key --delegation ~/.sqns/web.deleg -e '198.5
 ```
 
 Instead of exporting `SQNS_SERVER`, you can list servers in `~/.sqns/config`,
-one `sqc://` address per line, `#` for comments.
+one address per line, `#` for comments.
 
 A long-running node should hold its record open, which republishes inside the
 TTL and withdraws the key on exit:
@@ -132,6 +132,58 @@ string clients need. Defaults are `/etc/sqns/sqnsd.key` and
 
 `sqnsd --show-pubkey` prints the server's public key, and nothing else, for
 scripts.
+
+## Addresses
+
+Two forms, differing only in what they promise about DNS:
+
+```
+sqns://ns.squic.org/9Yb1A35fjEVVxphy5sGKfqC9fhTD9etoJQ4gVSa1jEKb
+sqc://198.51.100.4:5300/9Yb1A35fjEVVxphy5sGKfqC9fhTD9etoJQ4gVSa1jEKb
+```
+
+`sqns://` is the sqns-specific form: the port defaults to 5300, and the
+hostname must resolve through a **validated DNSSEC chain**. Validation happens
+in the client, not on trust — the system's resolvers are used as transport and
+the signatures are checked locally against the root anchor, so a resolver that
+lies, or a network tampering on the way to one, is caught either way. An
+unsigned zone is refused, because "unsigned" is a valid DNSSEC answer and would
+otherwise sail through:
+
+```
+$ sqns --server sqns://google.com/<key> status
+google.com resolved, but the answer is not signed (DNSSEC proof was not Secure
+for 10 record(s)). An sqns:// address requires a signed zone: use sqc://
+instead, or allow insecure DNS.
+```
+
+`sqc://` is the generic sQUIC form and promises nothing about resolution. Use
+it for IP literals, unsigned zones, and anywhere DNS is not involved. A bare
+`host:port/<key>` means the same thing.
+
+**Neither scheme is what keeps you safe.** The key is in the address and sQUIC
+pins it, so a forged DNS answer reaches a host that cannot complete the
+handshake — a failed connection, never an impersonation. You can watch that
+happen:
+
+```
+$ sqns --server sqns://google.com/<key> --insecure-dns status
+could not reach sqns://google.com:5300/<key>: 209.85.202.138:5300:
+io: handshake timed out
+```
+
+DNSSEC protects the pointer, not the identity. `--insecure-dns` exists for
+networks whose resolvers cannot carry DNSSEC; `sqnsd` takes the same flag and
+`require_dnssec = false` for its peers and upstreams.
+
+Validation costs about 1.5 MB of binary, so it lives behind a default-on
+`dnssec` cargo feature. Built without it, an `sqns://` hostname is refused
+rather than quietly resolved unvalidated:
+
+| build | size |
+|---|---|
+| `sqns` with DNSSEC (default) | 4.76 MB |
+| `--no-default-features` | 3.32 MB |
 
 ## Service keys and identities
 

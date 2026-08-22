@@ -31,6 +31,9 @@ pub struct ResolverConfig {
     /// How many hops a lookup may be forwarded through by servers that do not
     /// hold the key. Zero asks each server for what it holds itself.
     pub recurse: u8,
+    /// Whether an `sqns://` address must resolve through a validated DNSSEC
+    /// chain. Turning this off is what `--insecure-dns` does.
+    pub require_dnssec: bool,
 }
 
 impl Default for ResolverConfig {
@@ -41,6 +44,7 @@ impl Default for ResolverConfig {
             connect_timeout: Duration::from_secs(10),
             cache: true,
             recurse: DEFAULT_RECURSE,
+            require_dnssec: true,
         }
     }
 }
@@ -454,10 +458,11 @@ impl Resolver {
                 }
             }
         }
-        let conn = conn::connect(
+        let conn = conn::connect_with(
             &self.config.servers[idx],
             self.config.client_key_hex.clone(),
             self.config.connect_timeout,
+            self.config.require_dnssec,
         )
         .await?;
         let resp = conn::exchange(&conn, req).await?;

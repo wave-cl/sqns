@@ -26,7 +26,7 @@ pub enum Error {
     #[error("record key mismatch: asked for {asked}, server answered for {got}")]
     KeyMismatch { asked: String, got: String },
 
-    #[error("invalid sqc:// address: {0}")]
+    #[error("address error: {0}")]
     Address(String),
 
     #[error("key {key} is revoked: {reason}")]

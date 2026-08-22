@@ -9,7 +9,7 @@
 //! - [`record`] — records, delegations, revocations, signing and verification
 //! - [`protocol`] — the request/response wire format spoken over sQUIC
 //! - [`key`] — base58 public keys and on-disk private seeds
-//! - [`addr`] — `sqc://host:port/<base58 key>` server addresses
+//! - [`addr`] — `sqns://` and `sqc://` server addresses
 
 pub mod addr;
 pub mod codec;
@@ -18,7 +18,7 @@ pub mod key;
 pub mod protocol;
 pub mod record;
 
-pub use addr::ServerAddr;
+pub use addr::{Scheme, ServerAddr};
 pub use error::{Error, Result};
 pub use key::PubKey;
 pub use protocol::{ALPN, DEFAULT_PORT, Request, Response};

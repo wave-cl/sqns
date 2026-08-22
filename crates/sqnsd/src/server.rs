@@ -198,6 +198,7 @@ pub async fn bind(config: Config, signing_key: SigningKey) -> Result<Bound> {
         Arc::clone(&store),
         client_key_hex.clone(),
         config.sync_interval,
+        config.require_dnssec,
     ));
     let upstream = Arc::new(Upstream::new(
         &config.upstreams,
@@ -206,6 +207,7 @@ pub async fn bind(config: Config, signing_key: SigningKey) -> Result<Bound> {
         config.upstream_timeout,
         config.upstream_cache,
         config.max_upstream_inflight,
+        config.require_dnssec,
     ));
 
     let allowed_keys = if config.allowed_clients.is_empty() {

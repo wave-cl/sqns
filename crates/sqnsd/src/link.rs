@@ -20,15 +20,22 @@ pub struct PeerLink {
     /// so a server that whitelists its clients can allow us.
     client_key_hex: String,
     connect_timeout: Duration,
+    require_dnssec: bool,
 }
 
 impl PeerLink {
-    pub fn new(addr: ServerAddr, client_key_hex: String, connect_timeout: Duration) -> Self {
+    pub fn new(
+        addr: ServerAddr,
+        client_key_hex: String,
+        connect_timeout: Duration,
+        require_dnssec: bool,
+    ) -> Self {
         Self {
             addr,
             conn: Mutex::new(None),
             client_key_hex,
             connect_timeout,
+            require_dnssec,
         }
     }
 
@@ -48,10 +55,11 @@ impl PeerLink {
                 }
             }
         }
-        let conn = conn::connect(
+        let conn = conn::connect_with(
             &self.addr,
             Some(self.client_key_hex.clone()),
             self.connect_timeout,
+            self.require_dnssec,
         )
         .await?;
         let resp = conn::exchange(&conn, req).await?;

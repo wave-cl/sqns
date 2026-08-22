@@ -5,7 +5,8 @@ use std::time::Duration;
 use sqns_core::addr::ServerAddr;
 use sqns_core::error::{Error, Result};
 use sqns_core::protocol::{ALPN, Request, Response};
-use tokio::net::lookup_host;
+
+use crate::dns;
 
 /// Open an sQUIC connection to an sqns server.
 ///
@@ -17,16 +18,18 @@ pub async fn connect(
     client_key_hex: Option<String>,
     timeout: Duration,
 ) -> Result<quinn::Connection> {
-    let candidates: Vec<_> = lookup_host(addr.authority())
-        .await
-        .map_err(|e| Error::Connection(format!("cannot resolve {}: {e}", addr.authority())))?
-        .collect();
-    if candidates.is_empty() {
-        return Err(Error::Connection(format!(
-            "{} resolved to no addresses",
-            addr.authority()
-        )));
-    }
+    connect_with(addr, client_key_hex, timeout, true).await
+}
+
+/// As [`connect`], with control over whether an `sqns://` address really has
+/// to resolve through DNSSEC.
+pub async fn connect_with(
+    addr: &ServerAddr,
+    client_key_hex: Option<String>,
+    timeout: Duration,
+    require_dnssec: bool,
+) -> Result<quinn::Connection> {
+    let candidates = dns::resolve(addr, require_dnssec).await?;
 
     let mut last_err = None;
     for sock_addr in candidates {

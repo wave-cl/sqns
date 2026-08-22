@@ -38,6 +38,7 @@ impl Replicator {
         store: Arc<Store>,
         client_key_hex: String,
         sync_interval: Duration,
+        require_dnssec: bool,
     ) -> Self {
         Self {
             peers: peers
@@ -47,6 +48,7 @@ impl Replicator {
                         addr.clone(),
                         client_key_hex.clone(),
                         Duration::from_secs(10),
+                        require_dnssec,
                     ),
                     watermark: Mutex::new(0),
                 })

@@ -31,6 +31,7 @@ fn test_config(peers: Vec<ServerAddr>) -> Config {
         upstream_cache: true,
         max_upstream_inflight: 8,
         allowed_clients: Vec::new(),
+        require_dnssec: true,
         allow_sync: true,
         // Short enough that a test can wait for a pull.
         sync_interval: Duration::from_millis(300),
@@ -68,6 +69,7 @@ fn client_for(servers: &[&TestServer]) -> Resolver {
         // Tests assert on what the server holds, not on a local cache.
         cache: false,
         recurse: sqns_core::protocol::DEFAULT_RECURSE,
+        require_dnssec: true,
     })
     .expect("resolver")
 }
@@ -396,6 +398,7 @@ async fn a_client_falls_back_to_the_next_server() {
         connect_timeout: Duration::from_millis(500),
         cache: false,
         recurse: sqns_core::protocol::DEFAULT_RECURSE,
+        require_dnssec: true,
     })
     .unwrap();
 
@@ -795,6 +798,7 @@ async fn no_recurse_asks_only_what_the_server_itself_holds() {
         connect_timeout: Duration::from_secs(5),
         cache: false,
         recurse: 0,
+        require_dnssec: true,
     })
     .unwrap();
 
@@ -854,6 +858,7 @@ async fn a_chain_resolves_while_the_budget_lasts() {
         connect_timeout: Duration::from_secs(5),
         cache: false,
         recurse: 2,
+        require_dnssec: true,
     })
     .unwrap();
     assert!(plenty.lookup(&service.pubkey()).await.unwrap().is_some());
@@ -865,6 +870,7 @@ async fn a_chain_resolves_while_the_budget_lasts() {
         connect_timeout: Duration::from_secs(5),
         cache: false,
         recurse: 1,
+        require_dnssec: true,
     })
     .unwrap();
     let fresh = Service::new();

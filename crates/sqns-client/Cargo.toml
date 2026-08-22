@@ -13,6 +13,14 @@ tokio = { workspace = true }
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }
 tracing = { workspace = true }
+hickory-resolver = { workspace = true, optional = true }
+
+[features]
+default = ["dnssec"]
+# Validating DNSSEC resolution for sqns:// addresses. Turning it off drops the
+# hickory dependency; sqns:// addresses are then refused rather than resolved
+# without the validation their scheme promises.
+dnssec = ["dep:hickory-resolver"]
 
 [dev-dependencies]
 rand = { workspace = true }
