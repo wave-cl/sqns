@@ -1,10 +1,7 @@
 # sqns
 
-Resolution of sQUIC public keys to network endpoints.
-
-An sQUIC service is identified by an Ed25519 public key, and reached at a
-`sqc://host:port/<base58 key>` address. sqns answers the middle part of that
-string: **given the key, where is it right now?**
+Resolution of sQUIC public keys to network endpoints, built on
+[sQUIC](https://github.com/wave-cl/squic-rust).
 
 ```
 $ sqns resolve 2mTFsr7ozzywfcCzRENivZcWiFPpbbuejGXe61oRX1eu
@@ -13,19 +10,41 @@ $ sqns resolve 2mTFsr7ozzywfcCzRENivZcWiFPpbbuejGXe61oRX1eu
 backup.example.com:4433
 ```
 
-Keys stay fixed while addresses move. A node publishes where it can be reached,
-signed by the key it is publishing for, and refreshes that record on a timer;
-anything holding the key can look it up. When a key does have to change — a
-breach, a rebuild — lookups of the old one **forward to the new one**, so the
-callers still holding it are carried across rather than stranded.
+## Why
 
-## Why not DNS
+An sQUIC service is identified by an Ed25519 public key. Keys stay fixed while
+addresses move, so something has to answer *where is this key right now?* —
+and sqns answers it without becoming something you have to trust.
+
+- **The key is the name** — you look up the key you already pin. No zones, no
+  registrar, no names to squat or renew.
+- **Answers verify themselves** — every record is signed under the authority of
+  the key it describes, so a hostile server can withhold an answer but never
+  forge one. No CA, no certificate chain, no trust in whoever replied.
+- **Compromise is survivable** — service keys are issued by an identity key
+  kept offline, and that identity is the only thing that can retire them. A
+  stolen key cannot retire itself, and cannot forward anyone elsewhere.
+- **Rotation strands nobody** — a retired key forwards to its replacement, so
+  callers still holding the old one are carried across rather than failing.
+- **One identity, many services** — each service key resolves and rotates on
+  its own, so no private key is ever copied between machines.
+- **Silent servers** — inherited from sQUIC: a server says nothing at all to
+  anyone who does not already hold its public key.
+- **Replication needs no trust** — signatures travel with the records, so peers
+  relay them and cannot alter them.
+
+Addresses may be resolved through DNSSEC, but that is defence in depth for the
+*pointer* — the pinned key is what establishes identity, and it does so whether
+or not DNS behaves.
+
+Port 5300/UDP. A public server runs at `sqns://ns.squic.org`, so a fresh
+install resolves with no setup at all.
+
+### Why not DNS
 
 sqns is not a DNS server and speaks no DNS. There are no names, no zones and no
 referrals — the lookup key is a 32-byte Ed25519 public key, and an answer comes
-from one server or not at all. Answers are signed by that key, or by the
-identity that issued it, so verification needs no CA, no DNSSEC chain and no
-trust in the server that answered.
+from one server or not at all.
 
 | | DNS | sqns |
 |---|---|---|
@@ -35,6 +54,13 @@ trust in the server that answered.
 | Transport | UDP/53, DoT, DoH, DoQ | sQUIC only |
 | Key compromise | reissue from the CA or zone | retire the key; lookups forward to its replacement |
 | Server visibility | responds to anyone | silent to anyone without its public key |
+
+## Status
+
+v0.1.0, and the wire protocol is still moving — the record format is already on
+its fourth revision. The ALPN stays `sqns/1` while that is true, so a
+mismatched client and server will connect and then fail while decoding rather
+than being turned away at the handshake. Upgrade both together.
 
 ## Install
 
@@ -199,8 +225,9 @@ rather than quietly resolved unvalidated:
 
 ## Service keys and identities
 
-The key you look up is the **service key**: the one in `sqc://host:port/<key>`,
-the one sQUIC pins, the one the node holds and signs its own records with.
+The key you look up is the **service key**: the one in an
+`sqns://host/<key>` address, the one sQUIC pins, the one the node holds and
+signs its own records with.
 
 Every service key carries a **delegation** from an **identity key** kept
 offline. The identity does exactly one job, and it is the job the service key
@@ -391,7 +418,7 @@ other side too.
 listen = "[::]:5300"
 key_file = "/etc/sqns/sqnsd.key"
 state_file = "/var/lib/sqns/records.db"
-peers = ["sqc://ns2.example.com:5300/EFj2YJzH6MwVfPnbLdR4SjrUkA9QpXhgK7CcTx31Wm5"]
+peers = ["sqns://ns2.example.com/EFj2YJzH6MwVfPnbLdR4SjrUkA9QpXhgK7CcTx31Wm5"]
 ```
 
 See [etc/sqnsd.toml](etc/sqnsd.toml) for every option.
@@ -402,7 +429,7 @@ A server answers from its own store. Point it at **upstreams** and a miss
 becomes a question rather than a dead end:
 
 ```toml
-upstreams = ["sqc://ns1.example.com:5300/EFj2YJzH6MwVfPnbLdR4SjrUkA9QpXhgK7CcTx31Wm5"]
+upstreams = ["sqns://ns1.example.com/EFj2YJzH6MwVfPnbLdR4SjrUkA9QpXhgK7CcTx31Wm5"]
 ```
 
 That is a different relationship from `peers`. Peering is bidirectional bulk
@@ -442,7 +469,7 @@ an outage and an absence are different answers, and the second one gets cached.
 use sqns_client::{Publisher, Resolver};
 
 // Resolve, following any rotation of the key you hold
-let resolver = Resolver::single("sqc://ns1.example.com:5300/EFj2…".parse()?)?;
+let resolver = Resolver::single("sqns://ns1.example.com/EFj2…".parse()?)?;
 let service = resolver.resolve_service(&"2mTF…".parse()?).await?;
 // service.key        — the key actually reached; pin this one
 // service.identity   — the identity that issued it
@@ -510,16 +537,27 @@ Binaries land in `target/release/`.
 
 ## Deployment
 
-`install.sh --server` does all of this; by hand it is:
+`install.sh --server` does all of this. By hand, note that the unit runs as an
+unprivileged `sqns` user, so that account and the file ownership have to exist
+before the service will start:
 
 ```bash
 sudo cp target/release/sqns target/release/sqnsd /usr/local/bin/
+sudo groupadd --system --gid 5300 sqns
+sudo useradd --system --uid 5300 --gid sqns --home-dir /var/lib/sqns \
+  --no-create-home --shell /usr/sbin/nologin sqns
 sudo mkdir -p /etc/sqns /var/lib/sqns
 sudo cp etc/sqnsd.toml /etc/sqns/
 sudo sqnsd keygen --out /etc/sqns/sqnsd.key
+sudo chown sqns:sqns /etc/sqns/sqnsd.key /var/lib/sqns
+sudo chmod 600 /etc/sqns/sqnsd.key
+sudo chmod 700 /var/lib/sqns
 ```
 
-Systemd (included as `etc/sqnsd.service`):
+The key must be 0600 and owned by `sqns`: sqnsd refuses to load a private key
+that is group- or world-readable.
+
+Systemd (included as `etc/sqnsd.service`, which also sandboxes the service):
 
 ```bash
 sudo cp etc/sqnsd.service /etc/systemd/system/
