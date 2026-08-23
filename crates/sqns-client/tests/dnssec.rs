@@ -31,6 +31,51 @@ async fn a_signed_zone_resolves() {
     println!("ns.squic.org -> {resolved:?}");
 }
 
+/// The public server should answer on both families.
+///
+/// Two things this guards against, both observed on ns.squic.org:
+///
+/// - A `/64`'s base address (`…::`) instead of the host address (`…::1`) is an
+///   easy typo, and the host is not configured with it, so packets are dropped
+///   rather than refused.
+/// - v6 addresses sort first, and `conn::connect` tries candidates in order,
+///   so a v6 address that black-holes costs every IPv6-capable client a full
+///   handshake timeout before it falls back to v4.
+///
+/// Note that IPv6 does not work end to end today regardless of this record:
+/// `squic::dial` always binds an IPv4 local socket (`0.0.0.0:0`), so quinn
+/// rejects any v6 remote with "invalid remote address". That fails fast rather
+/// than stalling, which is luck rather than design.
+#[tokio::test]
+#[ignore = "needs the real DNS"]
+async fn the_public_server_is_dual_stack() {
+    let resolved = dns::resolve(&addr("sqns://ns.squic.org"), true)
+        .await
+        .expect("resolve");
+    println!("ns.squic.org -> {resolved:?}");
+
+    assert!(
+        resolved.iter().any(|a| a.is_ipv4()),
+        "no A record: {resolved:?}"
+    );
+    assert!(
+        resolved.iter().any(|a| a.is_ipv6()),
+        "no AAAA record, so IPv6-only clients cannot reach it: {resolved:?}"
+    );
+
+    // A /64's base address is the classic typo — the host is almost never
+    // configured with it, so packets are dropped rather than refused.
+    for addr in resolved.iter().filter(|a| a.is_ipv6()) {
+        let std::net::IpAddr::V6(ip) = addr.ip() else {
+            unreachable!()
+        };
+        assert!(
+            ip.segments()[4..] != [0, 0, 0, 0],
+            "{ip} is a subnet base address, not a host address — check the AAAA record"
+        );
+    }
+}
+
 /// google.com carries no DS record, so DNSSEC calls it Insecure — a perfectly
 /// valid outcome, and exactly the case that would sail through if the code
 /// only checked for validation *errors*.
