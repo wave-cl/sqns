@@ -1774,7 +1774,7 @@ dependencies = [
 
 [[package]]
 name = "sqns"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "clap",
  "ed25519-dalek",
@@ -1790,7 +1790,7 @@ dependencies = [
 
 [[package]]
 name = "sqns-client"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ed25519-dalek",
  "hickory-resolver",
@@ -1804,7 +1804,7 @@ dependencies = [
 
 [[package]]
 name = "sqns-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bs58",
  "dirs",
@@ -1818,7 +1818,7 @@ dependencies = [
 
 [[package]]
 name = "sqnsd"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "clap",
  "ed25519-dalek",
@@ -1838,8 +1838,8 @@ dependencies = [
 
 [[package]]
 name = "squic"
-version = "0.12.0"
-source = "git+https://github.com/wave-cl/squic-rust#518c6d4c6fe20c206dcbffe274b21f879e290521"
+version = "0.13.0"
+source = "git+https://github.com/wave-cl/squic-rust?tag=v0.13.0#e4f6a193f0154d037f711abf90719e23be87abf0"
 dependencies = [
  "chacha20poly1305",
  "curve25519-dalek",
