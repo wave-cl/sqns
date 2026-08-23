@@ -1,5 +1,6 @@
 //! Dialing sqns servers over sQUIC.
 
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use sqns_core::addr::ServerAddr;
@@ -38,10 +39,29 @@ pub async fn connect_with(
     timeout: Duration,
     require_dnssec: bool,
 ) -> Result<quinn::Connection> {
-    let candidates = dns::resolve(addr, require_dnssec).await?;
-    if candidates.is_empty() {
+    let all = dns::resolve(addr, require_dnssec).await?;
+    if all.is_empty() {
         return Err(Error::Connection(format!("{addr} resolved to no addresses")));
     }
+
+    // Drop addresses this host has no route to, rather than handing them to
+    // quinn and letting it fail noisily: a machine without IPv6 would log a
+    // "No route to host" warning on every single lookup, for an attempt that
+    // was never going to work. If the check rules everything out it is more
+    // likely wrong than the network is, so fall back to trying them all and
+    // let the real errors speak.
+    let routable: Vec<SocketAddr> = all.iter().copied().filter(|a| is_routable(*a)).collect();
+    let candidates = if routable.is_empty() {
+        all.clone()
+    } else {
+        if routable.len() < all.len() {
+            tracing::debug!(
+                skipped = all.len() - routable.len(),
+                "ignoring addresses with no route from here"
+            );
+        }
+        routable
+    };
 
     // Race the candidates instead of walking them.
     //
@@ -91,6 +111,19 @@ pub async fn connect_with(
         "could not reach {addr}: {}",
         errors.join("; ")
     )))
+}
+
+/// Whether this host has a route to `addr`.
+///
+/// `connect` on a UDP socket only performs a routing lookup — nothing is sent —
+/// so the answer is local and immediate.
+fn is_routable(addr: SocketAddr) -> bool {
+    let bind: SocketAddr = if addr.is_ipv6() {
+        (Ipv6Addr::UNSPECIFIED, 0).into()
+    } else {
+        (Ipv4Addr::UNSPECIFIED, 0).into()
+    };
+    std::net::UdpSocket::bind(bind).is_ok_and(|sock| sock.connect(addr).is_ok())
 }
 
 /// Run one request/response exchange on a fresh bidirectional stream.
