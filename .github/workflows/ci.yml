@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The live DNSSEC tests are #[ignore]d and stay that way: they need
+      # working network and a reachable ns.squic.org, and a push must not
+      # depend on the health of a deployed service.
+      - name: Test
+        run: cargo test --workspace
+
+      # This tree is clean, so warnings are errors here. The other repos are
+      # not there yet.
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
