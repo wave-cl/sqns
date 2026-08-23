@@ -33,19 +33,17 @@ async fn a_signed_zone_resolves() {
 
 /// The public server should answer on both families.
 ///
-/// Two things this guards against, both observed on ns.squic.org:
+/// Only presence is asserted here. Whether an address actually *works* cannot
+/// be checked from a machine without IPv6, and most CI has none — the way the
+/// broken record was found was by connecting from a v6-capable host and
+/// watching it stall for the full handshake timeout, which no unit test can
+/// stand in for.
 ///
-/// - A `/64`'s base address (`…::`) instead of the host address (`…::1`) is an
-///   easy typo, and the host is not configured with it, so packets are dropped
-///   rather than refused.
-/// - v6 addresses sort first, and `conn::connect` tries candidates in order,
-///   so a v6 address that black-holes costs every IPv6-capable client a full
-///   handshake timeout before it falls back to v4.
-///
-/// Note that IPv6 does not work end to end today regardless of this record:
-/// `squic::dial` always binds an IPv4 local socket (`0.0.0.0:0`), so quinn
-/// rejects any v6 remote with "invalid remote address". That fails fast rather
-/// than stalling, which is luck rather than design.
+/// Note that ns.squic.org publishes `2a01:4f8:1c16:b6b6::`, the base address of
+/// its /64. That looks like the classic dropped-suffix typo and originally was
+/// one, but the registrar refused `…::1`, so the host now claims the published
+/// address instead. It is the subnet-router anycast address, which is
+/// unconventional for a host and fine here because nothing else is on that /64.
 #[tokio::test]
 #[ignore = "needs the real DNS"]
 async fn the_public_server_is_dual_stack() {
@@ -62,18 +60,6 @@ async fn the_public_server_is_dual_stack() {
         resolved.iter().any(|a| a.is_ipv6()),
         "no AAAA record, so IPv6-only clients cannot reach it: {resolved:?}"
     );
-
-    // A /64's base address is the classic typo — the host is almost never
-    // configured with it, so packets are dropped rather than refused.
-    for addr in resolved.iter().filter(|a| a.is_ipv6()) {
-        let std::net::IpAddr::V6(ip) = addr.ip() else {
-            unreachable!()
-        };
-        assert!(
-            ip.segments()[4..] != [0, 0, 0, 0],
-            "{ip} is a subnet base address, not a host address — check the AAAA record"
-        );
-    }
 }
 
 /// google.com carries no DS record, so DNSSEC calls it Insecure — a perfectly
