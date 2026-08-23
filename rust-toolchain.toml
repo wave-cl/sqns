@@ -1,0 +1,30 @@
+[toolchain]
+# Pin stable to a specific minor version so new clippy lints don't surprise
+# CI between commits. CI (dtolnay/rust-toolchain@stable) honors this file,
+# so local and CI run the same clippy.
+#
+# This was not hypothetical: this workspace was clean under 1.95 locally and
+# then failed CI twice on lints that only exist in 1.98 (question_mark,
+# manual_c_str_literals, for_kv_map).
+#
+# Bump procedure: update the channel, run `cargo clippy --all-targets --
+# -D warnings` locally to pick up any new lints, fix them in the same commit
+# as the bump. Deliberate, not automatic.
+channel = "1.98.0"
+components = ["clippy", "rustfmt"]
+# Targets whose std-lib must be pre-installed for the pinned channel. These
+# are exactly the release matrix in .github/workflows/release.yml, and the
+# list is load-bearing: that workflow's `dtolnay/rust-toolchain@stable` step
+# attaches `targets:` to *stable*, then cargo reads this file and switches to
+# the pinned channel. The moment stable moves past the pin, a target
+# installed on stable is absent from the pinned toolchain and every release
+# build fails with E0463 "can't find crate for std".
+#
+# Adding a target via `rustup target add` outside this file has the same
+# problem in reverse — it attaches to whatever channel was last defaulted.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+]
