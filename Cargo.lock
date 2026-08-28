@@ -391,7 +391,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7c1832837b905bbfb5101e07cc24c8deddf52f93225eee6ead5f4d63d53ddcb"
 dependencies = [
  "const-oid",
+ "der_derive",
+ "flagset",
  "zeroize",
+]
+
+[[package]]
+name = "der_derive"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8034092389675178f570469e6c3b0465d3d30b4505c294a6550db47f3c17ad18"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -519,6 +532,12 @@ name = "find-msvc-tools"
 version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d45db016d36b838f563236e9193d0ee6ce38f3f68b6c94e914b4929c96bbb890"
+
+[[package]]
+name = "flagset"
+version = "0.4.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7ac824320a75a52197e8f2d787f6a38b6718bb6897a35142d749af3c0e8f4fe"
 
 [[package]]
 name = "foldhash"
@@ -1838,8 +1857,8 @@ dependencies = [
 
 [[package]]
 name = "squic"
-version = "0.13.2"
-source = "git+https://github.com/wave-cl/squic-rust?tag=v0.13.2#39116143a7eb18a3838f2c5fcc631bcecb99ff60"
+version = "0.16.0"
+source = "git+https://github.com/wave-cl/squic-rust?tag=v0.16.0#4ecbe67ebff420d132976b5bd29d83274de84070"
 dependencies = [
  "chacha20poly1305",
  "curve25519-dalek",
@@ -1858,6 +1877,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "x25519-dalek",
+ "x509-cert",
 ]
 
 [[package]]
@@ -2482,6 +2502,17 @@ dependencies = [
  "rand_core 0.6.4",
  "serde",
  "zeroize",
+]
+
+[[package]]
+name = "x509-cert"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1301e935010a701ae5f8655edc0ad17c44bad3ac5ce8c39185f75453b720ae94"
+dependencies = [
+ "const-oid",
+ "der",
+ "spki",
 ]
 
 [[package]]
