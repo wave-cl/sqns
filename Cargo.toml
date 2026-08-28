@@ -8,12 +8,12 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
-squic = { git = "https://github.com/wave-cl/squic-rust", tag = "v0.17.0" }
+squic = { git = "https://github.com/wave-cl/squic-rust", tag = "v0.18.0" }
 sqns-core = { path = "crates/sqns-core" }
 sqns-client = { path = "crates/sqns-client", default-features = false }
 tokio = { version = "1", features = ["full"] }

@@ -18,6 +18,12 @@ fn default_sync_interval() -> u64 {
     60
 }
 
+/// SIP-29: both envelope versions, because retiring one is a deployment's own
+/// decision and the default should not make it for them.
+fn default_envelope_versions() -> Vec<u8> {
+    vec![1, 2]
+}
+
 fn default_persist_interval() -> u64 {
     30
 }
@@ -85,6 +91,12 @@ pub struct FileConfig {
     /// How often to write the snapshot, in seconds.
     #[serde(default = "default_persist_interval")]
     pub persist_interval_secs: u64,
+
+    /// The sQUIC envelope versions this server parses (SIP-29). Narrowing this
+    /// to `[2]` retires version 1, after which clients older than sqns v0.3.1
+    /// cannot reach this server at all.
+    #[serde(default = "default_envelope_versions")]
+    pub accepted_envelope_versions: Vec<u8>,
 }
 
 /// Configuration with everything parsed and resolved.
@@ -103,6 +115,7 @@ pub struct Config {
     pub allow_sync: bool,
     pub sync_interval: Duration,
     pub persist_interval: Duration,
+    pub accepted_envelope_versions: Vec<u8>,
 }
 
 impl Config {
@@ -147,6 +160,18 @@ impl FileConfig {
             allow_sync: self.allow_sync,
             sync_interval: Duration::from_secs(self.sync_interval_secs.max(5)),
             persist_interval: Duration::from_secs(self.persist_interval_secs.max(1)),
+            accepted_envelope_versions: {
+                // Version 0 is reserved by SIP-29 and must never be emitted, and
+                // an empty set would silently refuse every caller.
+                if self.accepted_envelope_versions.is_empty()
+                    || self.accepted_envelope_versions.contains(&0)
+                {
+                    return Err(Error::Protocol(
+                        "accepted_envelope_versions must be a non-empty list without 0".into(),
+                    ));
+                }
+                self.accepted_envelope_versions
+            },
         })
     }
 }

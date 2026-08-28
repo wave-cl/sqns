@@ -209,6 +209,7 @@ fn build_config(cli: &Cli) -> Result<Config> {
                 allow_sync: true,
                 sync_interval_secs: 60,
                 persist_interval_secs: 30,
+                accepted_envelope_versions: vec![1, 2],
             }
             .resolve()?
         }

@@ -36,6 +36,7 @@ fn test_config(peers: Vec<ServerAddr>) -> Config {
         // Short enough that a test can wait for a pull.
         sync_interval: Duration::from_millis(300),
         persist_interval: Duration::from_secs(3600),
+        accepted_envelope_versions: vec![1, 2],
     }
 }
 

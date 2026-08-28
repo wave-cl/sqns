@@ -227,6 +227,7 @@ pub async fn bind(config: Config, signing_key: SigningKey) -> Result<Bound> {
         allowed_keys,
         max_incoming_streams: 256,
         max_idle_timeout: Duration::from_secs(60),
+        accepted_envelope_versions: config.accepted_envelope_versions.clone(),
         ..Default::default()
     };
 
